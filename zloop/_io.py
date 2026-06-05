@@ -486,6 +486,8 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         future: asyncio.Future[None] = self.create_future()
 
         def _on_writable() -> None:
+            if future.done():  # may fire again before remove_writer takes effect
+                return
             err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if err != 0:
                 future.set_exception(OSError(err, f"Connect call failed {address!r}"))
