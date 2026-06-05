@@ -61,14 +61,10 @@ pub fn create(
 
 /// A fresh copy of the current contextvars context, matching asyncio's default
 /// of running callbacks in contextvars.copy_context() when none is given.
+/// PyContext_CopyCurrent is the raw C-API that copy_context() wraps - using it
+/// directly skips a Python-level function call per handle (what uvloop does).
 fn makeContext() py.Object {
-    const copy = py.importFrom("contextvars", "copy_context");
-    if (copy == null) {
-        py.c.PyErr_Clear();
-        return py.none();
-    }
-    defer py.decref(copy);
-    const ctx = py.callNoArgs(copy);
+    const ctx = c.PyContext_CopyCurrent();
     if (ctx == null) {
         py.c.PyErr_Clear();
         return py.none();
@@ -94,21 +90,23 @@ pub fn run(self: *HandleObject) void {
 }
 
 fn runInContext(self: *HandleObject) py.Object {
-    // context.run(callback, *args)
-    const run_attr = py.getAttr(self.context, "run");
-    if (run_attr == null) return null;
-    defer py.decref(run_attr);
-
-    const nargs = py.tupleSize(self.args);
-    const call_args = py.tupleNew(nargs + 1);
-    if (call_args == null) return null;
-    defer py.decref(call_args);
-    py.tupleSet(call_args, 0, py.newRef(self.callback));
-    var i: py.ssize = 0;
-    while (i < nargs) : (i += 1) {
-        py.tupleSet(call_args, i + 1, py.newRef(py.tupleGet(self.args, i)));
+    // Enter the captured context, invoke callback(*args) directly, then exit -
+    // the raw C-API path (no `context.run` attribute lookup or extra arg tuple).
+    if (c.PyContext_Enter(self.context) != 0) return null;
+    const result = py.callTuple(self.callback, self.args);
+    // Exit even on error; preserve the callback's exception across the exit.
+    const exc = c.PyErr_GetRaisedException();
+    if (c.PyContext_Exit(self.context) != 0) {
+        // A failed exit is unexpected; surface it if the callback itself was OK.
+        if (exc != null) py.decref(exc);
+        py.xdecref(result);
+        return null;
     }
-    return py.callTuple(run_attr, call_args);
+    if (exc != null) {
+        c.PyErr_SetRaisedException(exc);
+        return null; // result is null here
+    }
+    return result;
 }
 
 fn reportException(self: *HandleObject) void {

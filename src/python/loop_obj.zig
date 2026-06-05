@@ -138,10 +138,12 @@ fn makeHandle(self: *LoopObject, callback: py.Object, cb_args: py.Object, contex
 }
 
 /// Slice a method-args tuple to the callback's positional args (everything
-/// after `from`). Returns a new tuple reference.
+/// after `from`). Returns a new tuple reference. The no-extra-args case (the
+/// common call_soon(cb) / call_later(d, cb)) returns the cached empty tuple.
 fn sliceArgs(args: py.Object, from: py.ssize) py.Object {
     const total = py.tupleSize(args);
     const n = total - from;
+    if (n == 0) return py.emptyTuple();
     const out = py.tupleNew(n);
     if (out == null) return null;
     var i: py.ssize = 0;

@@ -159,6 +159,14 @@ pub fn importFrom(module: [*c]const u8, attr: [*c]const u8) Object {
 pub fn tupleNew(len: ssize) Object {
     return c.PyTuple_New(len);
 }
+
+/// A new reference to a (shared, immutable) empty tuple - avoids allocating a
+/// fresh 0-length tuple on every no-args callback.
+var empty_tuple_cache: Object = null;
+pub fn emptyTuple() Object {
+    if (empty_tuple_cache == null) empty_tuple_cache = c.PyTuple_New(0);
+    return newRef(empty_tuple_cache);
+}
 /// Store `item` at `idx`, stealing its reference (matches PyTuple_SET_ITEM).
 pub fn tupleSet(tuple: Object, idx: ssize, item: Object) void {
     _ = c.PyTuple_SetItem(tuple, idx, item);
