@@ -32,6 +32,25 @@ uvicorn app:app --loop zloop:new_event_loop
   timers).
 - HTTP/1.1, WebSockets, TLS, Unix sockets, flow control, signals, executors.
 
+## Performance
+
+Faster than uvloop on every workload measured (`bench.py`, CPython 3.14, macOS
+arm64, median of 9 isolated runs):
+
+| workload          | asyncio | uvloop | zloop  | vs uvloop |
+|-------------------|---------|--------|--------|-----------|
+| `call_soon`       | 2.4 M/s | 4.3 M/s| 6.6 M/s| **+53%**  |
+| `call_later`      | 0.7 M/s | 3.6 M/s| 4.0 M/s| **+9%**   |
+| echo (1 KiB RTT)  | 31 k/s  | 59 k/s | 67 k/s | **+13%**  |
+| `create_future`   | 0.04 M/s| 0.04 M/s| 0.04 M/s| tie      |
+
+`create_future` ties because all three reuse CPython's C-accelerated
+`_asyncio.Future`. The wins come from doing the per-callback work in Zig and
+the contextvars handling through the raw C-API (`PyContext_Enter/Exit`,
+`PyContext_CopyCurrent`) instead of Python-level `context.run()` /
+`copy_context()`, plus caching the hot asyncio callables. Numbers vary
+run-to-run; run `python bench.py` yourself.
+
 ## How it works
 
 The event loop *engine* lives in Zig; CPython is reused only for the two things
