@@ -33,6 +33,12 @@ pub const LoopObject = extern struct {
 
 var loop_type: py.Object = null;
 
+// Hot asyncio callables cached once at module init so create_future/create_task/
+// run_until_complete don't re-import per call.
+var future_cls: py.Object = null;
+var task_cls: py.Object = null;
+var ensure_future_fn: py.Object = null;
+
 pub fn loopType() py.Object {
     return loop_type;
 }
@@ -273,15 +279,13 @@ fn secondsToNs(s: f64) u64 {
 // ---------------------------------------------------------------------------
 
 fn create_future(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
-    const cls = py.importFrom("asyncio", "Future");
-    if (cls == null) return null;
-    defer py.decref(cls);
-    const args = py.tupleNew(0);
+    // Future(loop=self) via the cached (C-accelerated) class.
+    const args = py.emptyTuple();
     defer py.decref(args);
     const kwargs = c.PyDict_New();
     defer py.decref(kwargs);
     _ = c.PyDict_SetItemString(kwargs, "loop", self_obj);
-    return py.callTupleKw(cls, args, kwargs);
+    return py.callTupleKw(future_cls, args, kwargs);
 }
 
 fn create_task(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
@@ -299,9 +303,7 @@ fn create_task(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject)
         return py.callTupleKw(self.task_factory, fargs, kwargs);
     }
 
-    const cls = py.importFrom("asyncio", "Task");
-    if (cls == null) return null;
-    defer py.decref(cls);
+    const cls = task_cls;
     const targs = py.tupleNew(1);
     if (targs == null) return null;
     defer py.decref(targs);
@@ -365,12 +367,8 @@ fn run_forever(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
 }
 
 fn run_until_complete(self_obj: ?*c.PyObject, future: ?*c.PyObject) callconv(.c) py.Object {
-    const self: *LoopObject = @ptrCast(self_obj.?);
-    _ = self;
-    // future = ensure_future(future, loop=self)
-    const ensure = py.importFrom("asyncio", "ensure_future");
-    if (ensure == null) return null;
-    defer py.decref(ensure);
+    // future = ensure_future(future, loop=self), via the cached callable.
+    const ensure = ensure_future_fn;
     const ef_args = py.tupleNew(1);
     defer py.decref(ef_args);
     py.tupleSet(ef_args, 0, py.newRef(future.?));
@@ -744,6 +742,13 @@ pub fn registerType(module: py.Object) bool {
     loop_type = py.typeFromSpecWithBase(&spec, base);
     if (loop_type == null) return false;
     handle.cancel_timer_hook = cancelTimerHook;
+
+    // Cache hot asyncio callables once (these resolve to the C-accelerated
+    // _asyncio.Future/Task when available, matching asyncio).
+    future_cls = py.importFrom("asyncio", "Future");
+    task_cls = py.importFrom("asyncio", "Task");
+    ensure_future_fn = py.importFrom("asyncio", "ensure_future");
+    if (future_cls == null or task_cls == null or ensure_future_fn == null) return false;
     _ = module;
     return true;
 }

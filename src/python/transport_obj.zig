@@ -70,10 +70,21 @@ fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
     if (m == null) return null;
     defer py.decref(m);
     if (st.context == null or py.isNone(st.context)) return py.callOneArg(m, arg);
-    const run = py.getAttr(st.context, "run");
-    if (run == null) return null;
-    defer py.decref(run);
-    return py.c.PyObject_CallFunctionObjArgs(run, m, arg, @as(py.Object, null));
+    // Run under the connection's context via the raw C-API (no context.run
+    // attribute lookup), preserving the callback's exception across the exit.
+    if (py.c.PyContext_Enter(st.context) != 0) return null;
+    const result = py.callOneArg(m, arg);
+    const exc = py.c.PyErr_GetRaisedException();
+    if (py.c.PyContext_Exit(st.context) != 0) {
+        if (exc != null) py.decref(exc);
+        py.xdecref(result);
+        return null;
+    }
+    if (exc != null) {
+        py.c.PyErr_SetRaisedException(exc);
+        return null;
+    }
+    return result;
 }
 
 var transport_type: py.Object = null;
