@@ -135,7 +135,9 @@ fn reportException(self: *HandleObject) void {
         return;
     }
     defer py.decref(ctx);
-    _ = c.PyDict_SetItemString(ctx, "message", py.fromStrZ("Exception in callback"));
+    const message = py.fromStrZ("Exception in callback");
+    _ = c.PyDict_SetItemString(ctx, "message", message);
+    py.xdecref(message);
     _ = c.PyDict_SetItemString(ctx, "exception", exc);
     _ = c.PyDict_SetItemString(ctx, "handle", @ptrCast(self));
 

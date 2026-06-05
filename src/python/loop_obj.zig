@@ -391,14 +391,50 @@ fn run_until_complete(self_obj: ?*c.PyObject, future: ?*c.PyObject) callconv(.c)
     py.decref(adc_res);
 
     const rf = run_forever(self_obj, null);
-    if (rf == null) return null;
+    if (rf == null) return null; // run_forever set the exception; leave it intact
     py.decref(rf);
+    // Remove our done-callback now that the loop has stopped, mirroring asyncio
+    // (the future may outlive this call if it was passed in rather than created).
+    removeDoneCallback(fut, stop_cb);
 
-    // return fut.result()
+    // If the loop stopped without the future completing (e.g. stop() called
+    // directly), asyncio raises a clear RuntimeError instead of letting
+    // fut.result() raise InvalidStateError.
+    if (!futureDone(fut)) {
+        return py.raiseRuntime("Event loop stopped before Future completed.");
+    }
+
     const result_attr = py.getAttr(fut, "result");
     if (result_attr == null) return null;
     defer py.decref(result_attr);
     return py.callNoArgs(result_attr);
+}
+
+fn removeDoneCallback(fut: py.Object, cb: py.Object) void {
+    const remove = py.getAttr(fut, "remove_done_callback");
+    if (remove == null) {
+        c.PyErr_Clear();
+        return;
+    }
+    defer py.decref(remove);
+    const r = py.callOneArg(remove, cb);
+    if (r == null) c.PyErr_Clear() else py.decref(r);
+}
+
+fn futureDone(fut: py.Object) bool {
+    const done = py.getAttr(fut, "done");
+    if (done == null) {
+        c.PyErr_Clear();
+        return true;
+    }
+    defer py.decref(done);
+    const r = py.callNoArgs(done);
+    if (r == null) {
+        c.PyErr_Clear();
+        return true;
+    }
+    defer py.decref(r);
+    return py.isTrue(r);
 }
 
 /// A small callable that calls loop.stop() ignoring its argument, used as the
@@ -496,8 +532,10 @@ fn ioRegister(self_obj: ?*c.PyObject, args: ?*c.PyObject, is_writer: bool) py.Ob
     const cb_args = sliceArgs(args, 2);
     if (cb_args == null) return null;
     defer py.decref(cb_args);
+    const context = py.none();
+    defer py.decref(context);
 
-    const h = makeHandle(self, callback, cb_args, py.none(), false);
+    const h = makeHandle(self, callback, cb_args, context, false);
     if (h == null) return null;
     // The IoCallback holds the only ref to h (dispose decrefs it).
     const eng = engineOf(self) orelse {

@@ -130,6 +130,14 @@ pub const Loop = struct {
     }
 
     pub fn deinit(self: *Loop) void {
+        // Release every token still owned by the engine so its embedder (the
+        // Python adapter) can drop the Handle refs it holds. Without this,
+        // callbacks scheduled but never run when the loop closes would leak.
+        self.drainXthread(); // moves cross-thread tokens into `ready`
+        while (self.ready.pop()) |token| self.dispatcher.drop(self.dispatcher.ctx, token);
+        for (self.timers.heap.items) |timer| {
+            if (!timer.cancelled) self.dispatcher.drop(self.dispatcher.ctx, timer.token);
+        }
         var it = self.fds.valueIterator();
         while (it.next()) |st| {
             if (st.reader) |cb| cb.dispose_();

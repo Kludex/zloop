@@ -146,6 +146,72 @@ def test_transport_attributes_and_protocol(loop: asyncio.AbstractEventLoop) -> N
     run(loop, main())
 
 
+def test_write_after_write_eof_raises(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+        errs: list[type] = []
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                transport.write_eof()
+                try:
+                    transport.write(b"after eof")
+                except RuntimeError:
+                    errs.append(RuntimeError)
+                try:
+                    transport.writelines([b"x"])
+                except RuntimeError:
+                    errs.append(RuntimeError)
+                transport.close()
+                self.transport = transport
+
+        await loop.create_connection(Client, host, port)
+        await asyncio.sleep(0.05)
+        server.close()
+        await server.wait_closed()
+        assert errs == [RuntimeError, RuntimeError]
+
+    run(loop, main())
+
+
+def test_set_write_buffer_limits_validation(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+        results: dict[str, object] = {}
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                # high < low is invalid
+                try:
+                    transport.set_write_buffer_limits(high=10, low=100)
+                except ValueError:
+                    results["invalid"] = True
+                # negative is invalid
+                try:
+                    transport.set_write_buffer_limits(high=-1)
+                except ValueError:
+                    results["negative"] = True
+                # only-low derives high = 4*low
+                transport.set_write_buffer_limits(low=100)
+                results["only_low"] = transport.get_write_buffer_limits()
+                # only-high derives low = high//4
+                transport.set_write_buffer_limits(high=400)
+                results["only_high"] = transport.get_write_buffer_limits()
+                transport.close()
+                self.transport = transport
+
+        await loop.create_connection(Client, host, port)
+        await asyncio.sleep(0.05)
+        server.close()
+        await server.wait_closed()
+        assert results["invalid"] is True
+        assert results["negative"] is True
+        assert results["only_low"] == (100, 400)
+        assert results["only_high"] == (100, 400)
+
+    run(loop, main())
+
+
 def test_transport_write_eof(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> None:
         eof_seen: asyncio.Future[None] = loop.create_future()

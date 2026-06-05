@@ -25,7 +25,7 @@ pub const TransportObject = extern struct {
 /// plain header + pointer.
 const State = struct {
     fd: sys.fd_t,
-    loop_obj: py.Object, // borrowed (the loop owns transports' lifetime via protocol refs)
+    loop_obj: py.Object, // owned - keeps the Loop (and its `engine`) alive
     engine: *core.Loop,
     protocol: py.Object, // owned
     self_obj: py.Object, // borrowed back-pointer for callbacks
@@ -39,6 +39,9 @@ const State = struct {
     low_water: usize = DEFAULT_HIGH_WATER / 4,
 
     reading: bool = true,
+    /// Set once the peer half-closed and eof_received() asked to keep the
+    /// connection open; resume_reading must not re-arm the reader after this.
+    read_eof: bool = false,
     writing_paused: bool = false, // protocol asked to pause? (we set on >high)
     write_registered: bool = false,
     eof_sent: bool = false,
@@ -101,7 +104,10 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     };
     st.* = .{
         .fd = fd,
-        .loop_obj = loop_obj,
+        // Own a reference to the Loop so its engine (a raw pointer below) cannot
+        // be freed while this transport is alive. Visited in GC traverse/clear,
+        // so the Loop<->transport cycle stays collectable.
+        .loop_obj = py.newRef(loop_obj),
         .engine = engine,
         .protocol = py.newRef(protocol),
         .self_obj = obj,
@@ -145,6 +151,7 @@ fn destroyState(st: *State) void {
     py.xdecref(st.extra);
     py.xdecref(st.sock_obj);
     py.xdecref(st.context);
+    py.xdecref(st.loop_obj);
     st.write_buf.deinit(gpa);
     gpa.destroy(st);
 }
@@ -239,8 +246,10 @@ fn deliverBuffered(st: *State) void {
     if (r == null) reportProtocolError(st, "buffer_updated") else py.decref(r);
 }
 
+const READ_CHUNK = 64 * 1024;
+
 fn deliverData(st: *State) void {
-    var buf: [256 * 1024]u8 = undefined;
+    var buf: [READ_CHUNK]u8 = undefined;
     const n = sys.read(st.fd, &buf) catch |err| switch (err) {
         error.WouldBlock => return,
         error.Interrupted => return,
@@ -293,9 +302,10 @@ fn handleEof(st: *State) void {
     if (!keep_open) {
         closeTransport(st, null);
     } else {
-        // protocol wants the connection kept half-open: stop reading.
+        // protocol wants the connection kept half-open: stop reading for good.
         _ = st.engine.removeReader(st.fd);
         st.reading = false;
+        st.read_eof = true;
     }
 }
 
@@ -489,7 +499,9 @@ fn reportProtocolError(st: *State, where: [*c]const u8) void {
             defer py.decref(ctx);
             var msgbuf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(&msgbuf, "Error in protocol.{s}()", .{std.mem.span(where)}) catch "protocol error";
-            _ = py.c.PyDict_SetItemString(ctx, "message", py.fromStrZ(msg.ptr));
+            const message = py.fromStrZ(msg.ptr);
+            _ = py.c.PyDict_SetItemString(ctx, "message", message);
+            py.xdecref(message);
             _ = py.c.PyDict_SetItemString(ctx, "exception", exc);
             _ = py.c.PyDict_SetItemString(ctx, "transport", st.self_obj);
             const r = py.callOneArg(handler, ctx);
@@ -532,6 +544,7 @@ fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) call
         if (st.extra != null) if (visit.?(st.extra, arg) != 0) return -1;
         if (st.sock_obj != null) if (visit.?(st.sock_obj, arg) != 0) return -1;
         if (st.context != null) if (visit.?(st.context, arg) != 0) return -1;
+        if (st.loop_obj != null) if (visit.?(st.loop_obj, arg) != 0) return -1;
     }
     return 0;
 }
@@ -540,10 +553,22 @@ fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
     const t: *TransportObject = @ptrCast(self_obj.?);
     py.c.PyObject_ClearManagedDict(@ptrCast(t));
     if (t.state) |st| {
+        // Detach from the engine before dropping the Loop reference, so a later
+        // dealloc cannot touch a freed engine through st.engine.
+        if (!st.conn_lost) {
+            if (st.reading) {
+                _ = st.engine.removeReader(st.fd);
+                st.reading = false;
+            }
+            stopWriting(st);
+            closeFd(st);
+            st.conn_lost = true;
+        }
         py.clear(&st.protocol);
         py.clear(&st.extra);
         py.clear(&st.sock_obj);
         py.clear(&st.context);
+        py.clear(&st.loop_obj);
     }
     return 0;
 }
@@ -555,6 +580,7 @@ fn stateOf(self_obj: ?*c.PyObject) ?*State {
 
 fn t_write(self_obj: ?*c.PyObject, data: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
+    if (st.eof_sent) return py.raiseRuntime("Cannot call write() after write_eof()");
     var view: c.Py_buffer = undefined;
     if (c.PyObject_GetBuffer(data.?, &view, c.PyBUF_SIMPLE) != 0) return null;
     defer c.PyBuffer_Release(&view);
@@ -565,6 +591,7 @@ fn t_write(self_obj: ?*c.PyObject, data: ?*c.PyObject) callconv(.c) py.Object {
 
 fn t_writelines(self_obj: ?*c.PyObject, seq: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
+    if (st.eof_sent) return py.raiseRuntime("Cannot call writelines() after write_eof()");
     const iter = c.PyObject_GetIter(seq.?);
     if (iter == null) return null;
     defer py.decref(iter);
@@ -628,7 +655,7 @@ fn t_pause_reading(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Obje
 
 fn t_resume_reading(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
-    if (!st.reading and !st.conn_lost) {
+    if (!st.reading and !st.conn_lost and !st.read_eof) {
         startReading(st) catch return py.raiseRuntime("zloop: resume_reading failed");
     }
     return py.none();
@@ -682,12 +709,25 @@ fn t_set_write_buffer_limits(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs:
     var kwlist = [_][*c]u8{ @constCast("high"), @constCast("low"), null };
     if (c.PyArg_ParseTupleAndKeywords(args, kwargs, "|OO", &kwlist, &high, &low) == 0) return null;
 
-    var h: usize = DEFAULT_HIGH_WATER;
-    if (high != null and !py.isNone(high.?)) h = @intCast(py.asI64(high.?) orelse return null);
-    var l: usize = h / 4;
-    if (low != null and !py.isNone(low.?)) l = @intCast(py.asI64(low.?) orelse return null);
-    st.high_water = h;
-    st.low_water = l;
+    // Mirror asyncio's derivation and validation exactly.
+    var h: ?i64 = null;
+    if (high != null and !py.isNone(high.?)) h = py.asI64(high.?) orelse return null;
+    var l: ?i64 = null;
+    if (low != null and !py.isNone(low.?)) l = py.asI64(low.?) orelse return null;
+
+    if (h == null) {
+        h = if (l == null) DEFAULT_HIGH_WATER else 4 * l.?;
+    }
+    if (l == null) {
+        l = @divTrunc(h.?, 4);
+    }
+    if (!(h.? >= l.? and l.? >= 0)) {
+        var buf: [96]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "high ({d}) must be >= low ({d}) must be >= 0", .{ h.?, l.? }) catch "invalid water marks";
+        return py.raiseValue(msg.ptr);
+    }
+    st.high_water = @intCast(h.?);
+    st.low_water = @intCast(l.?);
     return py.none();
 }
 

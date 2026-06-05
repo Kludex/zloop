@@ -42,6 +42,16 @@ def test_cannot_run_while_running(loop: asyncio.AbstractEventLoop) -> None:
     run(loop, main())
 
 
+def test_run_until_complete_stopped_before_done(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> None:
+        # stop the loop from inside without completing the awaited future
+        loop.call_soon(loop.stop)
+        await asyncio.Future()  # never resolves
+
+    with pytest.raises(RuntimeError, match="stopped before Future completed"):
+        loop.run_until_complete(main())
+
+
 def test_close_idempotent(loop: asyncio.AbstractEventLoop) -> None:
     assert loop.is_closed() is False
     loop.close()
