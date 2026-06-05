@@ -192,6 +192,13 @@ fn call_soon(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) c
 }
 
 fn scheduleTimer(self: *LoopObject, when_s: f64, callback: py.Object, cb_args: py.Object, context: py.Object) py.Object {
+    return scheduleTimerNs(self, when_s, secondsToNs(when_s), callback, cb_args, context);
+}
+
+/// Schedule a timer given both the absolute deadline in seconds (for the
+/// TimerHandle's when()) and in monotonic ns (for the engine), avoiding a
+/// redundant seconds->ns conversion when the caller already has ns.
+fn scheduleTimerNs(self: *LoopObject, when_s: f64, when_ns: u64, callback: py.Object, cb_args: py.Object, context: py.Object) py.Object {
     const h = makeHandle(self, callback, cb_args, context, true);
     if (h == null) return null;
     const ho: *handle.HandleObject = @ptrCast(h);
@@ -201,7 +208,6 @@ fn scheduleTimer(self: *LoopObject, when_s: f64, callback: py.Object, cb_args: p
         py.decref(h);
         return py.raiseRuntime("loop is closed");
     };
-    const when_ns = secondsToNs(when_s);
     py.incref(h);
     const seq = eng.callAt(when_ns, @intFromPtr(h)) catch {
         py.decref(h);
@@ -237,8 +243,13 @@ fn call_later(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) 
     defer py.decref(cb_args);
     const context = extractContext(kwargs);
     defer py.decref(context);
-    const when = clock.nowSeconds() + @max(delay, 0);
-    return scheduleTimer(self, when, callback, cb_args, context);
+    // Compute the deadline once in ns from a single clock read; derive the
+    // seconds form for TimerHandle.when() without a second syscall.
+    const now_ns = clock.nowNs();
+    const d = @max(delay, 0);
+    const when_ns = now_ns + @as(u64, @intFromFloat(d * std.time.ns_per_s));
+    const when_s = @as(f64, @floatFromInt(now_ns)) / std.time.ns_per_s + d;
+    return scheduleTimerNs(self, when_s, when_ns, callback, cb_args, context);
 }
 
 fn call_soon_threadsafe(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {

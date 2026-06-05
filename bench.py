@@ -13,7 +13,7 @@ import uvloop
 
 import zloop
 
-REPEATS = 3
+REPEATS = 6
 N_CALLBACKS = 1_000_000
 N_TIMERS = 300_000
 N_FUTURES = 200_000
