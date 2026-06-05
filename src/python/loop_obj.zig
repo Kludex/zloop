@@ -603,7 +603,8 @@ fn call_exception_handler(self_obj: ?*c.PyObject, context: ?*c.PyObject) callcon
     if (py.isNone(self.exception_handler)) {
         return default_exception_handler(self_obj, context);
     }
-    const r = py.callOneArg(self.exception_handler, context.?);
+    // Custom handlers take (loop, context), matching asyncio.
+    const r = c.PyObject_CallFunctionObjArgs(self.exception_handler, self_obj, context.?, @as(py.Object, null));
     if (r == null) {
         // Exception in custom handler: fall back, mirroring asyncio.
         c.PyErr_Clear();

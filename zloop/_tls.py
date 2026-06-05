@@ -25,7 +25,7 @@ def start_tls_transport(
     server_hostname: str | None = None,
     ssl_handshake_timeout: float | None = None,
     ssl_shutdown_timeout: float | None = None,
-) -> Any:
+) -> tuple[Any, asyncio.Future[None]]:
     waiter: asyncio.Future[None] = loop.create_future()
     ssl_protocol = sslproto.SSLProtocol(
         loop,
@@ -42,18 +42,4 @@ def start_tls_transport(
     # the transport delivers ssl_protocol.connection_made(raw) and begins
     # reading, kicking off the handshake.
     loop._make_transport(sock.fileno(), ssl_protocol, extra)
-
-    # Surface handshake failures rather than leaving the waiter pending. We do
-    # not block here: the app protocol's connection_made fires after a
-    # successful handshake; on failure the waiter's exception is logged.
-    def _check(fut: asyncio.Future[None]) -> None:
-        if fut.cancelled():
-            return
-        exc = fut.exception()
-        if exc is not None:
-            loop.call_exception_handler(
-                {"message": "TLS handshake failed", "exception": exc}
-            )
-
-    waiter.add_done_callback(_check)
-    return ssl_protocol._get_app_transport()
+    return ssl_protocol._get_app_transport(), waiter

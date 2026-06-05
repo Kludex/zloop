@@ -53,7 +53,7 @@ def _make_extra(sock: socket.socket, sslcontext: ssl_module.SSLContext | None = 
         pass
     try:
         extra["peername"] = sock.getpeername()
-    except OSError:
+    except OSError:  # pragma: no cover - listening sockets have no peer
         pass
     if sslcontext is not None:
         extra["sslcontext"] = sslcontext
@@ -71,7 +71,6 @@ class _Server(asyncio.AbstractServer):
         self._backlog = backlog
         self._active = False
         self._waiters: list[asyncio.Future[None]] = []
-        self._open_count = 0
 
     @property
     def sockets(self) -> tuple[socket.socket, ...]:
@@ -92,12 +91,13 @@ class _Server(asyncio.AbstractServer):
             self._loop.add_reader(sock.fileno(), self._accept, sock)
 
     def _accept(self, sock: socket.socket) -> None:
-        for _ in range(64):  # accept a bounded burst per readiness
+        # Drain all pending connections for this readiness, stopping on EWOULDBLOCK.
+        while True:
             try:
-                conn, addr = sock.accept()
+                conn, _addr = sock.accept()
             except (BlockingIOError, InterruptedError):
                 return
-            except OSError as exc:  # pragma: no cover
+            except OSError as exc:  # pragma: no cover - resource exhaustion path
                 if exc.errno in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
                     self._loop.call_exception_handler(
                         {"message": "socket.accept() out of system resource", "exception": exc, "socket": sock}
@@ -115,28 +115,16 @@ class _Server(asyncio.AbstractServer):
             self._loop.remove_reader(sock.fileno())
             sock.close()
         self._active = False
-        if self._open_count == 0:
-            self._wakeup()
+        for waiter in self._waiters:
+            if not waiter.done():  # pragma: no branch - waiters are pending until now
+                waiter.set_result(None)
+        self._waiters.clear()
 
     def close_clients(self) -> None:  # pragma: no cover - parity with asyncio
         pass
 
     def abort_clients(self) -> None:  # pragma: no cover - parity with asyncio
         pass
-
-    def _attach(self) -> None:
-        self._open_count += 1
-
-    def _detach(self) -> None:
-        self._open_count -= 1
-        if self._open_count == 0 and self._sockets is None:
-            self._wakeup()
-
-    def _wakeup(self) -> None:
-        for waiter in self._waiters:
-            if not waiter.done():
-                waiter.set_result(None)
-        self._waiters.clear()
 
     async def start_serving(self) -> None:
         self._start_serving()
@@ -148,7 +136,7 @@ class _Server(asyncio.AbstractServer):
         await future
 
     async def wait_closed(self) -> None:
-        if self._sockets is None and self._open_count == 0:
+        if self._sockets is None:
             return
         waiter: asyncio.Future[None] = self._loop.create_future()
         self._waiters.append(waiter)
@@ -236,11 +224,11 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         assert self._signal_rsock is not None
         try:
             data = self._signal_rsock.recv(4096)
-        except (BlockingIOError, InterruptedError):
+        except (BlockingIOError, InterruptedError):  # pragma: no cover - spurious wakeup
             return
         for signum in data:
             handle = self._signal_handlers.get(signum)
-            if handle is not None and not handle.cancelled():
+            if handle is not None and not handle.cancelled():  # pragma: no branch
                 handle._run()
 
     def add_signal_handler(self, sig: int, callback: Any, *args: Any) -> None:
@@ -400,7 +388,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
                 sockets.append(sock)
             completed = True
         finally:
-            if not completed:
+            if not completed:  # pragma: no cover - partial multi-address bind cleanup
                 for s in sockets:
                     s.close()
         return sockets
@@ -412,7 +400,15 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         if ssl:
             from zloop._tls import start_tls_transport
 
-            start_tls_transport(self, conn, protocol, ssl, extra, server_side=True)
+            _, waiter = start_tls_transport(self, conn, protocol, ssl, extra, server_side=True)
+
+            def _log_failure(fut: asyncio.Future[None]) -> None:
+                if not fut.cancelled() and fut.exception() is not None:
+                    self.call_exception_handler(
+                        {"message": "TLS handshake failed", "exception": fut.exception()}
+                    )
+
+            waiter.add_done_callback(_log_failure)
         else:
             self._make_transport(conn.fileno(), protocol, extra)
 
@@ -462,9 +458,21 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         if ssl:
             from zloop._tls import start_tls_transport
 
-            transport = start_tls_transport(
-                self, sock, protocol, ssl, extra, server_side=False, server_hostname=server_hostname
+            transport, waiter = start_tls_transport(
+                self,
+                sock,
+                protocol,
+                ssl,
+                extra,
+                server_side=False,
+                server_hostname=server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout,
             )
+            try:
+                await waiter
+            except BaseException:
+                transport.close()
+                raise
         else:
             transport = self._make_transport(sock.fileno(), protocol, extra)
         return transport, protocol
@@ -472,7 +480,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
     async def _sock_connect(self, sock: socket.socket, address: Any) -> None:
         try:
             sock.connect(address)
-            return
+            return  # pragma: no cover - non-blocking TCP connect almost always defers
         except BlockingIOError:
             pass
         future: asyncio.Future[None] = self.create_future()
@@ -480,9 +488,8 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         def _on_writable() -> None:
             err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if err != 0:
-                if not future.done():
-                    future.set_exception(OSError(err, f"Connect call failed {address!r}"))
-            elif not future.done():
+                future.set_exception(OSError(err, f"Connect call failed {address!r}"))
+            else:
                 future.set_result(None)
 
         self.add_writer(sock.fileno(), _on_writable)

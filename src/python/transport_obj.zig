@@ -601,6 +601,17 @@ fn t_abort(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     return py.none();
 }
 
+/// _force_close(exc): drop the connection immediately, reporting `exc` to
+/// connection_lost. Used by asyncio.sslproto on handshake/IO failure.
+fn t_force_close(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv(.c) py.Object {
+    const st = stateOf(self_obj) orelse return py.none();
+    if (st.conn_lost) return py.none();
+    st.write_buf.clearRetainingCapacity();
+    const e: py.Object = if (exc != null and !py.isNone(exc.?)) exc.? else null;
+    doConnectionLost(st, e);
+    return py.none();
+}
+
 fn t_is_closing(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.true_();
     return py.boolean(st.closing or st.conn_lost);
@@ -699,6 +710,7 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "writelines", .ml_meth = t_writelines, .ml_flags = O, .ml_doc = null },
     .{ .ml_name = "close", .ml_meth = t_close, .ml_flags = NOARGS, .ml_doc = null },
     .{ .ml_name = "abort", .ml_meth = t_abort, .ml_flags = NOARGS, .ml_doc = null },
+    .{ .ml_name = "_force_close", .ml_meth = t_force_close, .ml_flags = O, .ml_doc = null },
     .{ .ml_name = "is_closing", .ml_meth = t_is_closing, .ml_flags = NOARGS, .ml_doc = null },
     .{ .ml_name = "pause_reading", .ml_meth = t_pause_reading, .ml_flags = NOARGS, .ml_doc = null },
     .{ .ml_name = "resume_reading", .ml_meth = t_resume_reading, .ml_flags = NOARGS, .ml_doc = null },

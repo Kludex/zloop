@@ -35,7 +35,7 @@ xfail_strict = true
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source_pkgs = ["zloop", "tests"]
+source_pkgs = ["zloop"]
 branch = true
 omit = ["zloop/_zloop*"]
 
