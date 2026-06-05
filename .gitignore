@@ -1,0 +1,11 @@
+.zig-cache/
+zig-out/
+build_err.txt
+*.so
+__pycache__/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+.uvicorn-upstream/
