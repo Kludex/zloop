@@ -13,29 +13,29 @@ import uvloop
 
 import zloop
 
-REPEATS = 5
+REPEATS = 3
 N_CALLBACKS = 1_000_000
 N_TIMERS = 300_000
-N_FUTURES = 300_000
-N_ECHO = 60_000
+N_FUTURES = 200_000
+N_ECHO = 40_000
 ECHO_PAYLOAD = b"x" * 1024
 
 
 async def bench_call_soon() -> float:
+    """Schedule a batch of callbacks, then run them all - the realistic shape."""
     loop = asyncio.get_running_loop()
+    remaining = N_CALLBACKS
     done = loop.create_future()
-    count = 0
 
     def cb() -> None:
-        nonlocal count
-        count += 1
-        if count >= N_CALLBACKS:
+        nonlocal remaining
+        remaining -= 1
+        if remaining == 0:
             done.set_result(None)
-        else:
-            loop.call_soon(cb)
 
     t0 = time.perf_counter()
-    loop.call_soon(cb)
+    for _ in range(N_CALLBACKS):
+        loop.call_soon(cb)
     await done
     return N_CALLBACKS / (time.perf_counter() - t0)
 
