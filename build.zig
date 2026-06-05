@@ -26,6 +26,13 @@ pub fn build(b: *std.Build) void {
     const ext_suffix = b.option([]const u8, "ext-suffix", "Extension module suffix") orelse
         (b.graph.environ_map.get("ZLOOP_EXT_SUFFIX") orelse return);
 
+    const core_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/python/module.zig"),
         .target = target,
@@ -33,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addIncludePath(.{ .cwd_relative = py_include });
+    mod.addImport("core", core_mod);
 
     const lib = b.addLibrary(.{
         .name = "_zloop",

@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zloop"
+version = "0.1.0"
+description = "An asyncio event loop with a Zig core."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Zig",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "coverage>=7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["zloop"]
+artifacts = ["zloop/*.so"]
+
+[tool.pytest.ini_options]
+addopts = "-rxXs --strict-config --strict-markers"
+asyncio_mode = "auto"
+xfail_strict = true
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source_pkgs = ["zloop", "tests"]
+branch = true
+omit = ["zloop/_zloop*"]
+
+[tool.coverage.report]
+precision = 2
+fail_under = 100
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "FA", "UP", "RUF100"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
