@@ -46,11 +46,32 @@ const State = struct {
     conn_lost: bool = false,
     /// Set once connection_made has been delivered; guards early writes.
     started: bool = false,
+    /// The protocol is a BufferedProtocol (get_buffer/buffer_updated), e.g.
+    /// asyncio.sslproto.SSLProtocol. Affects the read delivery path.
+    buffered: bool = false,
+    /// contextvars context captured at creation; protocol callbacks run under
+    /// it so create_task() inside data_received inherits the connection's
+    /// context, matching asyncio's per-connection context semantics. Owned.
+    context: py.Object = null,
 
     fn protocolPaused(self: *State) bool {
         return self.writing_paused;
     }
 };
+
+/// Call `method_name(arg)` on the protocol under the connection's captured
+/// context, so contextvars set outside propagate into the ASGI task. Returns
+/// the call result (new ref) or null with PyErr set.
+fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
+    const m = py.getAttr(st.protocol, method_name);
+    if (m == null) return null;
+    defer py.decref(m);
+    if (st.context == null or py.isNone(st.context)) return py.callOneArg(m, arg);
+    const run = py.getAttr(st.context, "run");
+    if (run == null) return null;
+    defer py.decref(run);
+    return py.c.PyObject_CallFunctionObjArgs(run, m, arg, @as(py.Object, null));
+}
 
 var transport_type: py.Object = null;
 
@@ -90,22 +111,22 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     // close it (not the bare fd) and keep it alive for its lifetime.
     const sock = py.c.PyDict_GetItemString(extra, "socket"); // borrowed
     if (sock != null) st.sock_obj = py.newRef(sock);
+    // A BufferedProtocol (get_buffer/buffer_updated) takes the zero-copy read
+    // path; SSLProtocol is one.
+    st.buffered = py.hasAttr(protocol, "get_buffer");
+    // Capture the current context so protocol callbacks (and the create_task
+    // they make) inherit contextvars set by the caller.
+    st.context = captureContext();
     t.state = st;
+    // tp_alloc already GC-tracks managed-dict instances on 3.12+, so we must not
+    // track again here (double-track is a fatal assertion).
 
-    // connection_made(transport) then begin reading. Deliver synchronously is
-    // wrong for asyncio ordering; schedule via call_soon-equivalent by starting
-    // the read registration now and calling connection_made immediately is what
-    // selector transports effectively do (connection_made before first read).
-    const cm = py.getAttr(protocol, "connection_made");
-    if (cm == null) {
-        destroyState(st);
-        py.decref(obj);
-        return null;
-    }
-    defer py.decref(cm);
-    const r = py.callOneArg(cm, obj);
+    // connection_made(transport) under the captured context, then begin
+    // reading (selector transports deliver connection_made before first read).
+    // After GC tracking, failures must release via decref (dealloc cleans up
+    // state and the fd) - never destroyState directly, or it double-frees.
+    const r = protoCall1(st, "connection_made", obj);
     if (r == null) {
-        destroyState(st);
         py.decref(obj);
         return null;
     }
@@ -113,7 +134,6 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     st.started = true;
 
     startReading(st) catch {
-        destroyState(st);
         py.decref(obj);
         return py.raiseRuntime("zloop: could not start reading");
     };
@@ -124,8 +144,24 @@ fn destroyState(st: *State) void {
     py.xdecref(st.protocol);
     py.xdecref(st.extra);
     py.xdecref(st.sock_obj);
+    py.xdecref(st.context);
     st.write_buf.deinit(gpa);
     gpa.destroy(st);
+}
+
+fn captureContext() py.Object {
+    const copy = py.importFrom("contextvars", "copy_context");
+    if (copy == null) {
+        py.c.PyErr_Clear();
+        return py.none();
+    }
+    defer py.decref(copy);
+    const ctx = py.callNoArgs(copy);
+    if (ctx == null) {
+        py.c.PyErr_Clear();
+        return py.none();
+    }
+    return ctx;
 }
 
 /// Close the connection's fd. Prefer closing the owning Python socket object so
@@ -152,7 +188,58 @@ fn readCallback(ctx: *anyopaque, ev: core.IoEvent) void {
     const st: *State = @ptrCast(@alignCast(ctx));
     if (st.conn_lost) return;
     _ = ev;
+    if (st.buffered) deliverBuffered(st) else deliverData(st);
+}
 
+/// BufferedProtocol path: get_buffer(sizehint) -> read into it ->
+/// buffer_updated(nbytes). Used by SSLProtocol.
+fn deliverBuffered(st: *State) void {
+    const get_buffer = py.getAttr(st.protocol, "get_buffer");
+    if (get_buffer == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    defer py.decref(get_buffer);
+    const hint = py.fromI64(-1);
+    defer py.decref(hint);
+    const buffer_obj = py.callOneArg(get_buffer, hint);
+    if (buffer_obj == null) {
+        reportProtocolError(st, "get_buffer");
+        return;
+    }
+    defer py.decref(buffer_obj);
+
+    var view: py.c.Py_buffer = undefined;
+    if (py.c.PyObject_GetBuffer(buffer_obj, &view, py.c.PyBUF_WRITABLE) != 0) {
+        reportProtocolError(st, "get_buffer");
+        return;
+    }
+    const dst: [*]u8 = @ptrCast(view.buf.?);
+    const cap: usize = @intCast(view.len);
+    const n = sys.read(st.fd, dst[0..cap]) catch |err| switch (err) {
+        error.WouldBlock, error.Interrupted => {
+            py.c.PyBuffer_Release(&view);
+            return;
+        },
+        else => {
+            py.c.PyBuffer_Release(&view);
+            fatalError(st, err);
+            return;
+        },
+    };
+    py.c.PyBuffer_Release(&view);
+
+    if (n == 0) {
+        handleEof(st);
+        return;
+    }
+    const arg = py.fromI64(@intCast(n));
+    defer py.decref(arg);
+    const r = protoCall1(st, "buffer_updated", arg);
+    if (r == null) reportProtocolError(st, "buffer_updated") else py.decref(r);
+}
+
+fn deliverData(st: *State) void {
     var buf: [256 * 1024]u8 = undefined;
     const n = sys.read(st.fd, &buf) catch |err| switch (err) {
         error.WouldBlock => return,
@@ -175,13 +262,7 @@ fn readCallback(ctx: *anyopaque, ev: core.IoEvent) void {
     }
     defer py.decref(data);
 
-    const dr = py.getAttr(st.protocol, "data_received");
-    if (dr == null) {
-        py.c.PyErr_Clear();
-        return;
-    }
-    defer py.decref(dr);
-    const r = py.callOneArg(dr, data);
+    const r = protoCall1(st, "data_received", data);
     if (r == null) {
         reportProtocolError(st, "data_received");
     } else {
@@ -341,6 +422,11 @@ fn fatalError(st: *State, err: anyerror) void {
     if (exc != null) py.decref(exc);
 }
 
+/// Tear down the connection: close the fd and stop I/O synchronously, but
+/// defer the protocol's connection_lost(exc) to the next loop iteration via
+/// call_soon - matching asyncio, so a set_protocol() that runs *after* close()
+/// (the WebSocket-upgrade handoff does exactly this) is observed by the
+/// connection_lost dispatch.
 fn doConnectionLost(st: *State, exc: py.Object) void {
     if (st.conn_lost) return;
     st.conn_lost = true;
@@ -352,19 +438,43 @@ fn doConnectionLost(st: *State, exc: py.Object) void {
     }
     closeFd(st);
 
+    scheduleConnectionLost(st, exc);
+}
+
+/// Schedule transport._deliver_connection_lost(exc) via the loop's call_soon.
+/// The Handle's args hold a ref to the transport, keeping it (and st) alive
+/// until the callback runs.
+fn scheduleConnectionLost(st: *State, exc: py.Object) void {
+    const call_soon = py.getAttr(st.loop_obj, "call_soon");
+    if (call_soon == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    defer py.decref(call_soon);
+    const method = py.getAttr(st.self_obj, "_deliver_connection_lost");
+    if (method == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    defer py.decref(method);
+    const arg: py.Object = if (exc != null) exc else py.c.Py_None();
+    const r = py.c.PyObject_CallFunctionObjArgs(call_soon, method, arg, @as(py.Object, null));
+    if (r == null) py.c.PyErr_Clear() else py.decref(r);
+}
+
+fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv(.c) py.Object {
+    const st = stateOf(self_obj) orelse return py.none();
+    if (st.protocol == null) return py.none();
     const cl = py.getAttr(st.protocol, "connection_lost");
     if (cl != null) {
         defer py.decref(cl);
-        const arg = if (exc != null) py.newRef(exc) else py.none();
-        defer py.decref(arg);
-        const r = py.callOneArg(cl, arg);
+        const r = py.callOneArg(cl, exc.?);
         if (r == null) py.c.PyErr_Clear() else py.decref(r);
     } else {
         py.c.PyErr_Clear();
     }
-
-    // Release protocol; the transport may outlive it via user references.
     py.clear(&st.protocol);
+    return py.none();
 }
 
 fn reportProtocolError(st: *State, where: [*c]const u8) void {
@@ -398,6 +508,8 @@ fn reportProtocolError(st: *State, where: [*c]const u8) void {
 
 fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const t: *TransportObject = @ptrCast(self_obj.?);
+    py.c.PyObject_GC_UnTrack(@ptrCast(t));
+    py.c.PyObject_ClearManagedDict(@ptrCast(t));
     if (t.state) |st| {
         if (!st.conn_lost) {
             if (st.reading) _ = st.engine.removeReader(st.fd);
@@ -407,7 +519,33 @@ fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         destroyState(st);
         t.state = null;
     }
-    py.freeInstance(@ptrCast(t));
+    const tp: [*c]c.PyTypeObject = c.Py_TYPE(@ptrCast(t));
+    const free = tp.*.tp_free.?;
+    free(@ptrCast(t));
+}
+
+fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
+    const t: *TransportObject = @ptrCast(self_obj.?);
+    if (py.c.PyObject_VisitManagedDict(@ptrCast(t), visit, arg) != 0) return -1;
+    if (t.state) |st| {
+        if (st.protocol != null) if (visit.?(st.protocol, arg) != 0) return -1;
+        if (st.extra != null) if (visit.?(st.extra, arg) != 0) return -1;
+        if (st.sock_obj != null) if (visit.?(st.sock_obj, arg) != 0) return -1;
+        if (st.context != null) if (visit.?(st.context, arg) != 0) return -1;
+    }
+    return 0;
+}
+
+fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
+    const t: *TransportObject = @ptrCast(self_obj.?);
+    py.c.PyObject_ClearManagedDict(@ptrCast(t));
+    if (t.state) |st| {
+        py.clear(&st.protocol);
+        py.clear(&st.extra);
+        py.clear(&st.sock_obj);
+        py.clear(&st.context);
+    }
+    return 0;
 }
 
 fn stateOf(self_obj: ?*c.PyObject) ?*State {
@@ -572,20 +710,26 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "get_write_buffer_size", .ml_meth = t_get_write_buffer_size, .ml_flags = NOARGS, .ml_doc = null },
     .{ .ml_name = "set_write_buffer_limits", .ml_meth = @ptrCast(&t_set_write_buffer_limits), .ml_flags = KW, .ml_doc = null },
     .{ .ml_name = "get_write_buffer_limits", .ml_meth = t_get_write_buffer_limits, .ml_flags = NOARGS, .ml_doc = null },
+    .{ .ml_name = "_deliver_connection_lost", .ml_meth = t_deliver_connection_lost, .ml_flags = O, .ml_doc = null },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
 var slots = [_]py.Slot{
     .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&t_dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
+    .{ .slot = c.Py_tp_traverse, .pfunc = @constCast(@ptrCast(&t_traverse)) },
+    .{ .slot = c.Py_tp_clear, .pfunc = @constCast(@ptrCast(&t_clear)) },
     .{ .slot = 0, .pfunc = null },
 };
 
+// A managed __dict__ lets callers (and tests) set instance attributes, e.g.
+// override transport.write, matching asyncio's pure-Python transports. Managed
+// dict requires GC participation (traverse/clear above).
 var spec = py.Spec{
     .name = "zloop.Transport",
     .basicsize = @sizeOf(TransportObject),
     .itemsize = 0,
-    .flags = c.Py_TPFLAGS_DEFAULT,
+    .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_HAVE_GC | c.Py_TPFLAGS_MANAGED_DICT,
     .slots = &slots,
 };
 

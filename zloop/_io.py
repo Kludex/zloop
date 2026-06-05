@@ -14,11 +14,33 @@ import asyncio
 import collections.abc
 import concurrent.futures
 import errno
+import functools
+import signal as signal_module
 import socket
 import ssl as ssl_module
+import threading
 from typing import Any
 
 from zloop import _zloop
+
+
+class _SignalHandle:
+    """A minimal Handle for a registered signal callback."""
+
+    __slots__ = ("_callback", "_cancelled")
+
+    def __init__(self, callback: Any) -> None:
+        self._callback = callback
+        self._cancelled = False
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self) -> None:  # pragma: no cover - parity with asyncio.Handle
+        self._cancelled = True
+
+    def _run(self) -> None:
+        self._callback()
 
 
 def _make_extra(sock: socket.socket, sslcontext: ssl_module.SSLContext | None = None) -> dict[str, Any]:
@@ -185,6 +207,71 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
     async def shutdown_asyncgens(self) -> None:
         # zloop does not register asyncgen finalizer hooks; nothing tracked.
         return None
+
+    # -- signals --------------------------------------------------------------
+    #
+    # Implemented like asyncio's selector loop: a self-pipe receives the signal
+    # numbers written by signal.set_wakeup_fd; a reader on it dispatches the
+    # registered handlers on the loop thread.
+
+    _signal_handlers: dict[int, Any]
+    _signal_rsock: socket.socket | None = None
+    _signal_wsock: socket.socket | None = None
+
+    def _ensure_signal_pipe(self) -> None:
+        if self._signal_rsock is not None:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            raise ValueError("add_signal_handler() can only be called from the main thread")
+        self._signal_handlers = {}
+        rsock, wsock = socket.socketpair()
+        rsock.setblocking(False)
+        wsock.setblocking(False)
+        self._signal_rsock = rsock
+        self._signal_wsock = wsock
+        signal_module.set_wakeup_fd(wsock.fileno())
+        self.add_reader(rsock.fileno(), self._process_signals)
+
+    def _process_signals(self) -> None:
+        assert self._signal_rsock is not None
+        try:
+            data = self._signal_rsock.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        for signum in data:
+            handle = self._signal_handlers.get(signum)
+            if handle is not None and not handle.cancelled():
+                handle._run()
+
+    def add_signal_handler(self, sig: int, callback: Any, *args: Any) -> None:
+        if not isinstance(sig, int):  # pragma: no cover - parity with asyncio
+            raise TypeError("sig must be an int")
+        self._ensure_signal_pipe()
+        # Install a no-op C handler; the wakeup fd carries the signum to us.
+        try:
+            signal_module.signal(sig, lambda s, f: None)
+        except (ValueError, OSError) as exc:  # pragma: no cover - bad signal
+            raise RuntimeError(str(exc)) from None
+        signal_module.siginterrupt(sig, False)
+        self._signal_handlers[sig] = _SignalHandle(functools.partial(callback, *args))
+
+    def remove_signal_handler(self, sig: int) -> bool:
+        handlers = getattr(self, "_signal_handlers", None)
+        if not handlers or sig not in handlers:
+            return False
+        del handlers[sig]
+        try:
+            signal_module.signal(sig, signal_module.SIG_DFL)
+        except (ValueError, OSError):  # pragma: no cover
+            return False
+        if not handlers and self._signal_rsock is not None:
+            signal_module.set_wakeup_fd(-1)
+            self.remove_reader(self._signal_rsock.fileno())
+            self._signal_rsock.close()
+            self._signal_wsock.close()  # type: ignore[union-attr]
+            self._signal_rsock = None
+            self._signal_wsock = None
+        return True
 
     async def getaddrinfo(
         self,
