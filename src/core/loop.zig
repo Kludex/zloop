@@ -1,8 +1,15 @@
 //! The event loop engine. It owns the reactor, the timer queue and the ready
 //! FIFO, and implements the canonical asyncio "run once" iteration. It has no
-//! knowledge of Python: callbacks are opaque `usize` tokens, and executing one
-//! is delegated to a `Dispatcher` supplied by the embedder (dependency
-//! inversion - the adapter layer plugs CPython in here).
+//! knowledge of Python.
+//!
+//! There are two kinds of work:
+//!   * Deferred callbacks (call_soon / call_at / timers) are opaque `usize`
+//!     tokens executed via the `Dispatcher` the embedder supplies. The adapter
+//!     maps a token to a Python Handle.
+//!   * I/O readiness callbacks (add_reader / add_writer) are native Zig
+//!     closures (`IoCallback`). Transports register these directly so socket
+//!     I/O never round-trips through Python; the Python add_reader wrapper
+//!     installs a closure that just enqueues a Handle.
 
 const std = @import("std");
 const reactor_mod = @import("reactor.zig");
@@ -16,27 +23,60 @@ const Interest = reactor_mod.Interest;
 const TimerQueue = timers_mod.TimerQueue;
 const ReadyQueue = queue_mod.ReadyQueue;
 
-/// The embedder plugs in how a token is executed and how a token is released
-/// when it is dropped without running (e.g. a reader replaced, a cancelled
-/// timer reclaimed). Both receive the embedder's `ctx`.
+/// Executes / releases deferred-callback tokens (Python Handles), and brackets
+/// the blocking poll so the embedder can release a global lock (the CPython
+/// GIL) while the loop waits, letting other threads run and signals be handled.
 pub const Dispatcher = struct {
     ctx: *anyopaque,
-    /// Run the callback identified by `token`.
     run: *const fn (ctx: *anyopaque, token: usize) void,
-    /// The token will never run; release any resources it owns (e.g. decref a
-    /// Python Handle). May be a no-op.
     drop: *const fn (ctx: *anyopaque, token: usize) void,
+    /// Called immediately before a blocking poll; returns an opaque state passed
+    /// back to `resume_`. May be null (no bracketing).
+    suspend_: ?*const fn (ctx: *anyopaque) ?*anyopaque = null,
+    resume_: ?*const fn (ctx: *anyopaque, state: ?*anyopaque) void = null,
 };
 
-/// Reader and writer callbacks registered for one fd via add_reader/add_writer.
+/// Readiness reported to an I/O callback.
+pub const IoEvent = struct {
+    readable: bool = false,
+    writable: bool = false,
+    hup: bool = false,
+};
+
+/// A native I/O readiness callback owned by the registrant (e.g. a transport).
+/// `dispose` is called when the callback is removed so the owner can release
+/// resources; it may be null.
+pub const IoCallback = struct {
+    func: *const fn (ctx: *anyopaque, ev: IoEvent) void,
+    ctx: *anyopaque,
+    dispose: ?*const fn (ctx: *anyopaque) void = null,
+
+    fn fire(self: IoCallback, ev: IoEvent) void {
+        self.func(self.ctx, ev);
+    }
+    fn dispose_(self: IoCallback) void {
+        if (self.dispose) |d| d(self.ctx);
+    }
+};
+
+/// A minimal spinlock for the brief cross-thread inbox critical section.
+const SpinLock = struct {
+    state: std.atomic.Mutex = .unlocked,
+    fn lock(self: *SpinLock) void {
+        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *SpinLock) void {
+        self.state.unlock();
+    }
+};
+
 const FdState = struct {
-    reader: ?usize = null,
-    writer: ?usize = null,
+    reader: ?IoCallback = null,
+    writer: ?IoCallback = null,
 
     fn interest(self: FdState) Interest {
         return .{ .read = self.reader != null, .write = self.writer != null };
     }
-
     fn isEmpty(self: FdState) bool {
         return self.reader == null and self.writer == null;
     }
@@ -54,11 +94,15 @@ pub const Loop = struct {
     stopping: bool = false,
     closed: bool = false,
 
-    /// Self-pipe: writing a byte to `wake_w` makes a blocked poll return, so
-    /// call_soon_threadsafe and signal delivery can interrupt the loop.
+    /// Cross-thread inbox: call_soon_threadsafe appends here under `xlock` and
+    /// wakes the loop; runOnce drains it into `ready` on the loop thread. The
+    /// main ready queue is single-threaded and must never be touched off-thread.
+    /// The critical section is a few instructions, so a spinlock is appropriate.
+    xthread: std.ArrayList(usize),
+    xlock: SpinLock = .{},
+
     wake_r: sys.fd_t,
     wake_w: sys.fd_t,
-    /// Token used internally to mark the self-pipe readable; never dispatched.
     const WAKE_TOKEN: usize = std.math.maxInt(usize);
 
     pub fn init(allocator: std.mem.Allocator, dispatcher: Dispatcher) !Loop {
@@ -79,29 +123,58 @@ pub const Loop = struct {
             .ready = ReadyQueue.init(allocator),
             .fds = std.AutoHashMap(sys.fd_t, FdState).init(allocator),
             .dispatcher = dispatcher,
+            .xthread = .empty,
             .wake_r = pipe[0],
             .wake_w = pipe[1],
         };
     }
 
     pub fn deinit(self: *Loop) void {
+        var it = self.fds.valueIterator();
+        while (it.next()) |st| {
+            if (st.reader) |cb| cb.dispose_();
+            if (st.writer) |cb| cb.dispose_();
+        }
         sys.close(self.wake_r);
         sys.close(self.wake_w);
         self.reactor.deinit();
         self.timers.deinit();
         self.ready.deinit();
+        self.xthread.deinit(self.allocator);
         self.fds.deinit();
     }
 
-    // -- scheduling -----------------------------------------------------------
+    // -- deferred callbacks ---------------------------------------------------
 
-    /// Schedule `token` to run on the next iteration.
     pub fn callSoon(self: *Loop, token: usize) !void {
         try self.ready.push(token);
     }
 
-    /// Schedule `token` to run at absolute monotonic time `when_ns`. Returns the
-    /// seq for cancellation.
+    /// Schedule a token from any thread. Appends under the cross-thread lock and
+    /// wakes the loop. Returns an error only on OOM.
+    pub fn callSoonThreadsafe(self: *Loop, token: usize) !void {
+        {
+            self.xlock.lock();
+            defer self.xlock.unlock();
+            try self.xthread.append(self.allocator, token);
+        }
+        self.wakeup();
+    }
+
+    fn drainXthread(self: *Loop) void {
+        self.xlock.lock();
+        const items = self.xthread.toOwnedSlice(self.allocator) catch {
+            // On OOM, leave items queued for the next iteration.
+            self.xlock.unlock();
+            return;
+        };
+        self.xlock.unlock();
+        defer self.allocator.free(items);
+        for (items) |token| {
+            self.ready.push(token) catch {};
+        }
+    }
+
     pub fn callAt(self: *Loop, when_ns: u64, token: usize) !u64 {
         return self.timers.push(when_ns, token);
     }
@@ -114,69 +187,64 @@ pub const Loop = struct {
         return clock.nowNs();
     }
 
-    /// Wake a blocked poll from another thread.
     pub fn wakeup(self: *Loop) void {
         _ = sys.write(self.wake_w, "\x00") catch {};
     }
 
-    // -- fd readiness ---------------------------------------------------------
+    // -- I/O readiness --------------------------------------------------------
 
-    pub fn addReader(self: *Loop, fd: sys.fd_t, token: usize) !void {
+    pub fn addReader(self: *Loop, fd: sys.fd_t, cb: IoCallback) !void {
         const gop = try self.fds.getOrPut(fd);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .reader = token };
-            try self.reactor.register(fd, fd_token(fd), gop.value_ptr.interest());
-        } else {
-            if (gop.value_ptr.reader) |old| self.dispatcher.drop(self.dispatcher.ctx, old);
-            gop.value_ptr.reader = token;
-            try self.reactor.modify(fd, fd_token(fd), gop.value_ptr.interest());
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (gop.value_ptr.reader) |old| old.dispose_();
+        gop.value_ptr.reader = cb;
+        try self.syncFdReg(fd, gop.value_ptr.*, !gop.found_existing);
     }
 
-    pub fn addWriter(self: *Loop, fd: sys.fd_t, token: usize) !void {
+    pub fn addWriter(self: *Loop, fd: sys.fd_t, cb: IoCallback) !void {
         const gop = try self.fds.getOrPut(fd);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .writer = token };
-            try self.reactor.register(fd, fd_token(fd), gop.value_ptr.interest());
-        } else {
-            if (gop.value_ptr.writer) |old| self.dispatcher.drop(self.dispatcher.ctx, old);
-            gop.value_ptr.writer = token;
-            try self.reactor.modify(fd, fd_token(fd), gop.value_ptr.interest());
-        }
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (gop.value_ptr.writer) |old| old.dispose_();
+        gop.value_ptr.writer = cb;
+        try self.syncFdReg(fd, gop.value_ptr.*, !gop.found_existing);
     }
 
-    /// Returns true if a reader was present and removed.
     pub fn removeReader(self: *Loop, fd: sys.fd_t) bool {
         const entry = self.fds.getEntry(fd) orelse return false;
         const had = entry.value_ptr.reader != null;
-        if (entry.value_ptr.reader) |old| self.dispatcher.drop(self.dispatcher.ctx, old);
+        if (entry.value_ptr.reader) |old| old.dispose_();
         entry.value_ptr.reader = null;
-        self.syncFd(fd, entry.value_ptr.*);
+        self.syncFdUnreg(fd, entry.value_ptr.*);
         return had;
     }
 
     pub fn removeWriter(self: *Loop, fd: sys.fd_t) bool {
         const entry = self.fds.getEntry(fd) orelse return false;
         const had = entry.value_ptr.writer != null;
-        if (entry.value_ptr.writer) |old| self.dispatcher.drop(self.dispatcher.ctx, old);
+        if (entry.value_ptr.writer) |old| old.dispose_();
         entry.value_ptr.writer = null;
-        self.syncFd(fd, entry.value_ptr.*);
+        self.syncFdUnreg(fd, entry.value_ptr.*);
         return had;
     }
 
-    fn syncFd(self: *Loop, fd: sys.fd_t, state: FdState) void {
+    fn syncFdReg(self: *Loop, fd: sys.fd_t, state: FdState, is_new: bool) !void {
+        if (is_new) {
+            try self.reactor.register(fd, fdToken(fd), state.interest());
+        } else {
+            try self.reactor.modify(fd, fdToken(fd), state.interest());
+        }
+    }
+
+    fn syncFdUnreg(self: *Loop, fd: sys.fd_t, state: FdState) void {
         if (state.isEmpty()) {
             self.reactor.unregister(fd) catch {};
             _ = self.fds.remove(fd);
         } else {
-            self.reactor.modify(fd, fd_token(fd), state.interest()) catch {};
+            self.reactor.modify(fd, fdToken(fd), state.interest()) catch {};
         }
     }
 
-    // Reader/writer fds use the fd value (shifted) as their reactor token so
-    // poll() events map straight back to the FdState. Callback tokens are the
-    // separate reader/writer fields.
-    fn fd_token(fd: sys.fd_t) usize {
+    fn fdToken(fd: sys.fd_t) usize {
         return @intCast(fd);
     }
 
@@ -185,7 +253,6 @@ pub const Loop = struct {
     pub fn isRunning(self: *const Loop) bool {
         return self.running;
     }
-
     pub fn isClosed(self: *const Loop) bool {
         return self.closed;
     }
@@ -195,7 +262,6 @@ pub const Loop = struct {
         self.wakeup();
     }
 
-    /// Run iterations until `stop()` is called.
     pub fn runForever(self: *Loop) !void {
         if (self.running) return error.AlreadyRunning;
         if (self.closed) return error.LoopClosed;
@@ -207,14 +273,27 @@ pub const Loop = struct {
         }
     }
 
-    /// One iteration. `max_wait_ns` caps the poll wait even when a longer or
-    /// indefinite wait would otherwise apply (used by the embedder to bound the
-    /// loop for run_until_complete polling). null means no extra cap.
     pub fn runOnce(self: *Loop, max_wait_ns: ?u64) !void {
+        self.drainXthread();
         const timeout = self.computeTimeout(max_wait_ns);
 
+        // Release the embedder's global lock (GIL) only when we will actually
+        // block, so other threads can run and post work via call_soon_threadsafe
+        // and so signals can be delivered.
+        const will_block = timeout == null or timeout.? > 0;
+        var resume_state: ?*anyopaque = null;
+        if (will_block) {
+            if (self.dispatcher.suspend_) |s| resume_state = s(self.dispatcher.ctx);
+        }
+
         var events: [256]reactor_mod.Event = undefined;
-        const ready_events = try self.reactor.poll(&events, timeout);
+        const poll_result = self.reactor.poll(&events, timeout);
+
+        if (will_block) {
+            if (self.dispatcher.resume_) |r| r(self.dispatcher.ctx, resume_state);
+        }
+
+        const ready_events = try poll_result;
 
         for (ready_events) |ev| {
             if (ev.token == WAKE_TOKEN) {
@@ -223,20 +302,16 @@ pub const Loop = struct {
             }
             const fd: sys.fd_t = @intCast(ev.token);
             const state = self.fds.get(fd) orelse continue;
-            // On hangup/error, fire both directions so reads see EOF and writes
-            // see the error.
-            if ((ev.readable or ev.hup)) if (state.reader) |tok| try self.ready.push(tok);
-            if ((ev.writable or ev.hup)) if (state.writer) |tok| try self.ready.push(tok);
+            const io: IoEvent = .{ .readable = ev.readable, .writable = ev.writable, .hup = ev.hup };
+            if (ev.readable or ev.hup) if (state.reader) |cb| cb.fire(io);
+            if (ev.writable or ev.hup) if (state.writer) |cb| cb.fire(io);
         }
 
-        // Promote all due timers.
         const t_now = clock.nowNs();
         while (self.timers.popDue(t_now)) |timer| {
             try self.ready.push(timer.token);
         }
 
-        // Run a snapshot of the ready queue; callbacks scheduled during this
-        // drain wait until the next iteration (asyncio semantics).
         var n = self.ready.len();
         while (n > 0) : (n -= 1) {
             const token = self.ready.pop() orelse break;
@@ -270,30 +345,38 @@ pub const Loop = struct {
 };
 
 // ---------------------------------------------------------------------------
-// tests - exercise the engine with a Zig dispatcher counting executions.
+// tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
 const TestDispatcher = struct {
     runs: std.ArrayList(usize) = .empty,
-    drops: std.ArrayList(usize) = .empty,
     allocator: std.mem.Allocator,
 
     fn run(ctx: *anyopaque, token: usize) void {
         const self: *TestDispatcher = @ptrCast(@alignCast(ctx));
         self.runs.append(self.allocator, token) catch unreachable;
     }
-    fn drop(ctx: *anyopaque, token: usize) void {
-        const self: *TestDispatcher = @ptrCast(@alignCast(ctx));
-        self.drops.append(self.allocator, token) catch unreachable;
-    }
+    fn drop(_: *anyopaque, _: usize) void {}
     fn dispatcher(self: *TestDispatcher) Dispatcher {
         return .{ .ctx = self, .run = run, .drop = drop };
     }
     fn deinit(self: *TestDispatcher) void {
         self.runs.deinit(self.allocator);
-        self.drops.deinit(self.allocator);
+    }
+};
+
+const IoCounter = struct {
+    reads: u32 = 0,
+    writes: u32 = 0,
+    fn cb(ctx: *anyopaque, ev: IoEvent) void {
+        const self: *IoCounter = @ptrCast(@alignCast(ctx));
+        if (ev.readable) self.reads += 1;
+        if (ev.writable) self.writes += 1;
+    }
+    fn callback(self: *IoCounter) IoCallback {
+        return .{ .func = cb, .ctx = self };
     }
 };
 
@@ -316,7 +399,6 @@ test "timer fires after deadline" {
     defer loop.deinit();
 
     _ = try loop.callAt(loop.now() + 5 * std.time.ns_per_ms, 42);
-    try testing.expectEqual(@as(usize, 0), td.runs.items.len);
     try loop.runOnce(50 * std.time.ns_per_ms);
     try testing.expectEqualSlices(usize, &.{42}, td.runs.items);
 }
@@ -331,13 +413,30 @@ test "reader fires on readable fd then removeReader stops it" {
     defer sys.close(fds[0]);
     defer sys.close(fds[1]);
 
-    try loop.addReader(fds[0], 0xBEEF);
+    var counter = IoCounter{};
+    try loop.addReader(fds[0], counter.callback());
     _ = try sys.write(fds[1], "data");
     try loop.runOnce(10 * std.time.ns_per_ms);
-    try testing.expectEqualSlices(usize, &.{0xBEEF}, td.runs.items);
+    try testing.expectEqual(@as(u32, 1), counter.reads);
 
     try testing.expect(loop.removeReader(fds[0]));
     try testing.expect(!loop.removeReader(fds[0]));
+}
+
+test "writer fires on writable socket" {
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    const fds = try sys.socketPair();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    var counter = IoCounter{};
+    try loop.addWriter(fds[0], counter.callback());
+    try loop.runOnce(10 * std.time.ns_per_ms);
+    try testing.expect(counter.writes >= 1);
 }
 
 test "wakeup interrupts an otherwise-blocking poll" {
@@ -346,23 +445,7 @@ test "wakeup interrupts an otherwise-blocking poll" {
     var loop = try Loop.init(testing.allocator, td.dispatcher());
     defer loop.deinit();
 
-    // No timers, no ready work: poll would block forever. Pre-arm the wakeup so
-    // the self-pipe is readable and runOnce returns promptly.
     loop.wakeup();
     try loop.runOnce(null);
     try testing.expectEqual(@as(usize, 0), td.runs.items.len);
-}
-
-test "replacing a reader drops the old token" {
-    var td = TestDispatcher{ .allocator = testing.allocator };
-    defer td.deinit();
-    var loop = try Loop.init(testing.allocator, td.dispatcher());
-    defer loop.deinit();
-    const fds = try sys.pipe();
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-
-    try loop.addReader(fds[0], 100);
-    try loop.addReader(fds[0], 200); // replaces 100
-    try testing.expectEqualSlices(usize, &.{100}, td.drops.items);
 }

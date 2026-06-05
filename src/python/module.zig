@@ -3,6 +3,7 @@ const py = @import("py.zig");
 const c = py.c;
 const loop_obj = @import("loop_obj.zig");
 const handle = @import("handle.zig");
+const transport = @import("transport_obj.zig");
 
 comptime {
     @export(&PyInit__zloop, .{ .name = "PyInit__zloop", .linkage = .strong });
@@ -31,6 +32,10 @@ fn PyInit__zloop() callconv(.c) ?*c.PyObject {
     if (m == null) return null;
 
     if (!handle.registerTypes(m)) {
+        py.decref(m);
+        return null;
+    }
+    if (!transport.registerType(m)) {
         py.decref(m);
         return null;
     }

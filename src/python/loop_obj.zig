@@ -7,6 +7,7 @@ const std = @import("std");
 const py = @import("py.zig");
 const c = py.c;
 const handle = @import("handle.zig");
+const transport = @import("transport_obj.zig");
 const core_root = @import("core");
 const core = core_root.loop;
 const clock = core_root.clock;
@@ -51,6 +52,16 @@ fn dispatchDrop(_: *anyopaque, token: usize) void {
     py.decref(@as(py.Object, @ptrCast(h)));
 }
 
+/// Release the GIL before a blocking poll so executor threads can run and post
+/// work, and signals can be delivered. Returns the saved thread state.
+fn dispatchSuspend(_: *anyopaque) ?*anyopaque {
+    return @ptrCast(c.PyEval_SaveThread());
+}
+
+fn dispatchResume(_: *anyopaque, state: ?*anyopaque) void {
+    c.PyEval_RestoreThread(@ptrCast(state));
+}
+
 fn cancelTimerHook(loop_obj: py.Object, token: usize, seq: u64) void {
     const self: *LoopObject = @ptrCast(loop_obj);
     if (self.engine) |eng| {
@@ -86,6 +97,8 @@ fn new(tp: [*c]c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py
         .ctx = engine,
         .run = dispatchRun,
         .drop = dispatchDrop,
+        .suspend_ = dispatchSuspend,
+        .resume_ = dispatchResume,
     }) catch {
         gpa.destroy(engine);
         py.decref(obj);
@@ -222,9 +235,24 @@ fn call_later(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) 
 
 fn call_soon_threadsafe(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
-    const h = call_soon(self_obj, args, kwargs);
+    if (py.tupleSize(args) < 1) return py.raiseType("call_soon_threadsafe requires a callback");
+    const callback = py.tupleGet(args, 0);
+    if (!py.isCallable(callback)) return py.raiseType("a callable is required");
+    const cb_args = sliceArgs(args, 1);
+    if (cb_args == null) return null;
+    defer py.decref(cb_args);
+    const context = extractContext(kwargs);
+    defer py.decref(context);
+
+    const h = makeHandle(self, callback, cb_args, context, false);
     if (h == null) return null;
-    if (engineOf(self)) |eng| eng.wakeup();
+    const eng = engineOf(self) orelse return py.raiseRuntime("loop is closed");
+    py.incref(h); // schedule holds a ref, released by dispatch
+    eng.callSoonThreadsafe(@intFromPtr(h)) catch {
+        py.decref(h);
+        py.decref(h);
+        return py.raiseRuntime("zloop: failed to schedule callback");
+    };
     return h;
 }
 
@@ -436,6 +464,105 @@ fn close_method(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
 }
 
 // ---------------------------------------------------------------------------
+// I/O readiness primitives (add_reader / add_writer)
+// ---------------------------------------------------------------------------
+//
+// A Python-registered reader/writer is wrapped in a native IoCallback that
+// simply enqueues the Handle on readiness, so it runs in the same iteration's
+// ready drain (matching asyncio's _add_callback). The IoCallback owns a ref to
+// the Handle, released via its dispose hook.
+
+fn pyReaderFire(ctx: *anyopaque, _: core.IoEvent) void {
+    const h: *handle.HandleObject = @ptrCast(@alignCast(ctx));
+    if (h.cancelled != 0) return;
+    const self: *LoopObject = @ptrCast(h.loop_obj);
+    const eng = self.engine orelse return;
+    py.incref(@as(py.Object, @ptrCast(h))); // dispatch will release
+    eng.callSoon(@intFromPtr(h)) catch py.decref(@as(py.Object, @ptrCast(h)));
+}
+
+fn pyIoDispose(ctx: *anyopaque) void {
+    const h: *handle.HandleObject = @ptrCast(@alignCast(ctx));
+    py.decref(@as(py.Object, @ptrCast(h)));
+}
+
+fn ioRegister(self_obj: ?*c.PyObject, args: ?*c.PyObject, is_writer: bool) py.Object {
+    const self: *LoopObject = @ptrCast(self_obj.?);
+    if (py.tupleSize(args) < 2) return py.raiseType("add_reader/add_writer(fd, callback, *args)");
+    const fd_obj = py.tupleGet(args, 0);
+    const fd = fdFromObject(fd_obj) orelse return null;
+    const callback = py.tupleGet(args, 1);
+    if (!py.isCallable(callback)) return py.raiseType("a callable is required");
+    const cb_args = sliceArgs(args, 2);
+    if (cb_args == null) return null;
+    defer py.decref(cb_args);
+
+    const h = makeHandle(self, callback, cb_args, py.none(), false);
+    if (h == null) return null;
+    // The IoCallback holds the only ref to h (dispose decrefs it).
+    const eng = engineOf(self) orelse {
+        py.decref(h);
+        return py.raiseRuntime("loop is closed");
+    };
+    const cb: core.IoCallback = .{ .func = pyReaderFire, .ctx = @ptrCast(h), .dispose = pyIoDispose };
+    const res = if (is_writer) eng.addWriter(fd, cb) else eng.addReader(fd, cb);
+    res catch {
+        py.decref(h);
+        return py.raiseRuntime("zloop: add_reader/writer failed");
+    };
+    return py.none();
+}
+
+fn add_reader(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    return ioRegister(self_obj, args, false);
+}
+fn add_writer(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    return ioRegister(self_obj, args, true);
+}
+
+fn remove_reader(self_obj: ?*c.PyObject, fd_obj: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *LoopObject = @ptrCast(self_obj.?);
+    const fd = fdFromObject(fd_obj.?) orelse return null;
+    const eng = engineOf(self) orelse return py.false_();
+    return py.boolean(eng.removeReader(fd));
+}
+fn remove_writer(self_obj: ?*c.PyObject, fd_obj: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *LoopObject = @ptrCast(self_obj.?);
+    const fd = fdFromObject(fd_obj.?) orelse return null;
+    const eng = engineOf(self) orelse return py.false_();
+    return py.boolean(eng.removeWriter(fd));
+}
+
+fn fdFromObject(o: py.Object) ?sys.fd_t {
+    // accept an int fd or an object with fileno()
+    if (c.PyLong_Check(o) != 0) {
+        const v = py.asI64(o) orelse return null;
+        return @intCast(v);
+    }
+    const fileno = py.getAttr(o, "fileno");
+    if (fileno == null) return null;
+    defer py.decref(fileno);
+    const r = py.callNoArgs(fileno);
+    if (r == null) return null;
+    defer py.decref(r);
+    const v = py.asI64(r) orelse return null;
+    return @intCast(v);
+}
+
+/// _make_transport(fd, protocol, extra) -> Transport. Used by the Python I/O
+/// orchestration (create_server/create_connection) to wrap a ready socket.
+fn make_transport(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
+    const self: *LoopObject = @ptrCast(self_obj.?);
+    var fd_obj: ?*c.PyObject = null;
+    var protocol: ?*c.PyObject = null;
+    var extra: ?*c.PyObject = null;
+    if (c.PyArg_UnpackTuple(args, "_make_transport", 3, 3, &fd_obj, &protocol, &extra) == 0) return null;
+    const fd = fdFromObject(fd_obj.?) orelse return null;
+    const eng = engineOf(self) orelse return py.raiseRuntime("loop is closed");
+    return transport.create(eng, self_obj.?, fd, protocol.?, extra.?);
+}
+
+// ---------------------------------------------------------------------------
 // debug + exception handling
 // ---------------------------------------------------------------------------
 
@@ -522,6 +649,7 @@ fn currentThreadId() u64 {
 const KW = c.METH_VARARGS | c.METH_KEYWORDS;
 const NOARGS = c.METH_NOARGS;
 const O = c.METH_O;
+const VARARGS = c.METH_VARARGS;
 
 var methods = [_]py.MethodDef{
     .{ .ml_name = "call_soon", .ml_meth = @ptrCast(&call_soon), .ml_flags = KW, .ml_doc = null },
@@ -545,6 +673,11 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = "set_exception_handler", .ml_meth = set_exception_handler, .ml_flags = O, .ml_doc = null },
     .{ .ml_name = "default_exception_handler", .ml_meth = default_exception_handler, .ml_flags = O, .ml_doc = null },
     .{ .ml_name = "call_exception_handler", .ml_meth = call_exception_handler, .ml_flags = O, .ml_doc = null },
+    .{ .ml_name = "add_reader", .ml_meth = add_reader, .ml_flags = VARARGS, .ml_doc = null },
+    .{ .ml_name = "add_writer", .ml_meth = add_writer, .ml_flags = VARARGS, .ml_doc = null },
+    .{ .ml_name = "remove_reader", .ml_meth = remove_reader, .ml_flags = O, .ml_doc = null },
+    .{ .ml_name = "remove_writer", .ml_meth = remove_writer, .ml_flags = O, .ml_doc = null },
+    .{ .ml_name = "_make_transport", .ml_meth = make_transport, .ml_flags = VARARGS, .ml_doc = null },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 

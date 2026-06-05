@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from zloop._zloop import Handle, Loop, TimerHandle
+from zloop._io import Loop
+from zloop._zloop import Handle, TimerHandle
 
 __all__ = ["Handle", "Loop", "TimerHandle", "new_event_loop"]
 
