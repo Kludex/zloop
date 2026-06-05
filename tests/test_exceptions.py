@@ -4,7 +4,6 @@ import asyncio
 
 import pytest
 
-import zloop
 from tests.conftest import run
 
 

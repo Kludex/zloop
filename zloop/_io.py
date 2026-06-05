@@ -104,7 +104,7 @@ class _Server(asyncio.AbstractServer):
                     )
                     return
                 raise
-            self._loop._connect_accepted(conn, self._protocol_factory, self._ssl, self)
+            self._loop._connect_accepted(conn, self._protocol_factory, self._ssl)
 
     def close(self) -> None:
         sockets = self._sockets
@@ -187,7 +187,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
             assert self._default_executor is not None
             self._default_executor.shutdown(wait=True)
             self.call_soon_threadsafe(future.set_result, None)
-        except Exception as exc:  # noqa: BLE001 - executor threads may raise anything
+        except Exception as exc:
             self.call_soon_threadsafe(future.set_exception, exc)
 
     # -- async generators -----------------------------------------------------
@@ -271,9 +271,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
         proto: int = 0,
         flags: int = 0,
     ) -> list[Any]:
-        return await self.run_in_executor(
-            None, socket.getaddrinfo, host, port, family, type, proto, flags
-        )
+        return await self.run_in_executor(None, socket.getaddrinfo, host, port, family, type, proto, flags)
 
     async def getnameinfo(self, sockaddr: Any, flags: int = 0) -> Any:
         return await self.run_in_executor(None, socket.getnameinfo, sockaddr, flags)
@@ -384,7 +382,8 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
                     sock.bind(sa)
                 except OSError as exc:
                     sock.close()
-                    raise OSError(exc.errno, f"error while attempting to bind on address {sa!r}: {exc.strerror}") from None
+                    msg = f"error while attempting to bind on address {sa!r}: {exc.strerror}"
+                    raise OSError(exc.errno, msg) from None
                 sockets.append(sock)
             completed = True
         finally:
@@ -393,7 +392,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
                     s.close()
         return sockets
 
-    def _connect_accepted(self, conn: socket.socket, protocol_factory: Any, ssl: Any, server: _Server) -> None:
+    def _connect_accepted(self, conn: socket.socket, protocol_factory: Any, ssl: Any) -> None:
         conn.setblocking(False)
         protocol = protocol_factory()
         extra = _make_extra(conn, ssl if ssl else None)
@@ -404,9 +403,7 @@ class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
 
             def _log_failure(fut: asyncio.Future[None]) -> None:
                 if not fut.cancelled() and fut.exception() is not None:
-                    self.call_exception_handler(
-                        {"message": "TLS handshake failed", "exception": fut.exception()}
-                    )
+                    self.call_exception_handler({"message": "TLS handshake failed", "exception": fut.exception()})
 
             waiter.add_done_callback(_log_failure)
         else:
