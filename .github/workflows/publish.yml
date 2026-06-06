@@ -44,6 +44,7 @@ jobs:
   build-wheels:
     name: "Wheels on ${{ matrix.os }}"
     runs-on: "${{ matrix.os }}"
+    timeout-minutes: 15
     permissions:
       contents: read # clone the private repo
     strategy:
@@ -75,6 +76,7 @@ jobs:
   build-sdist:
     name: Source distribution
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read # clone the private repo
     steps:
