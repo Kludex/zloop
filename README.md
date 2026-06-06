@@ -86,13 +86,22 @@ zig build test                 # run the pure-Zig core unit tests
 
 The build produces `zloop/_zloop<EXT_SUFFIX>.so`, importable as `zloop`.
 
-## Testing
+## Testing & checks
 
 ```bash
 # zloop's own suite + 100% coverage gate
 python -m coverage run --source=zloop -m pytest tests/
 python -m coverage report --fail-under=100
+
+zig build test                          # pure-Zig core unit tests
+ruff check zloop/ tests/                # lint (Python)
+ruff format --check zloop/ tests/       # format (Python)
+zig fmt --check src/ build.zig          # format (Zig)
+mypy zloop/                             # strict type check
 ```
+
+CI (`.github/workflows/ci.yml`) runs all of the above on macOS (kqueue) and
+Linux (epoll) across CPython 3.10-3.14.
 
 ## Platforms
 

@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Run Zig core unit tests
+        run: zig build test
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Create venv and install dev deps
+        run: |
+          uv venv --python ${{ matrix.python-version }} .venv
+          uv pip install pytest pytest-asyncio coverage ruff mypy trustme
+
+      - name: Build the extension
+        run: ./build_ext.sh .venv/bin/python
+
+      - name: Lint (ruff)
+        run: .venv/bin/python -m ruff check zloop/ tests/
+
+      - name: Format check (ruff + zig fmt)
+        run: |
+          .venv/bin/python -m ruff format --check zloop/ tests/
+          zig fmt --check src/ build.zig
+
+      - name: Type check (mypy)
+        run: .venv/bin/python -m mypy zloop/
+
+      - name: Test with 100% coverage gate
+        run: |
+          .venv/bin/python -m coverage run --source=zloop -m pytest tests/ -q
+          .venv/bin/python -m coverage report --fail-under=100
