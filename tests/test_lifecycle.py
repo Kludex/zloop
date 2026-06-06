@@ -68,6 +68,52 @@ def test_cannot_close_running_loop(loop: asyncio.AbstractEventLoop) -> None:
     run(loop, main())
 
 
+def test_closed_loop_rejects_scheduling(loop: asyncio.AbstractEventLoop) -> None:
+    loop.close()
+    with pytest.raises(RuntimeError, match="Event loop is closed"):
+        loop.call_soon(lambda: None)
+    with pytest.raises(RuntimeError, match="Event loop is closed"):
+        loop.call_later(1, lambda: None)
+    with pytest.raises(RuntimeError, match="Event loop is closed"):
+        loop.call_at(loop.time() + 1, lambda: None)
+    with pytest.raises(RuntimeError, match="Event loop is closed"):
+        loop.call_soon_threadsafe(lambda: None)
+
+
+def test_closed_loop_rejects_add_reader(loop: asyncio.AbstractEventLoop) -> None:
+    import socket
+
+    s = socket.socket()
+    loop.close()
+    try:
+        with pytest.raises(RuntimeError, match="Event loop is closed"):
+            loop.add_reader(s.fileno(), lambda: None)
+    finally:
+        s.close()
+
+
+def test_add_reader_rejects_bad_fd(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> None:
+        with pytest.raises(ValueError):
+            loop.add_reader(-1, lambda: None)
+
+    run(loop, main())
+
+
+def test_call_later_nan_inf_does_not_crash(loop: asyncio.AbstractEventLoop) -> None:
+    fired: list[str] = []
+
+    async def main() -> None:
+        loop.call_later(float("nan"), fired.append, "nan")
+        loop.call_later(float("inf"), fired.append, "inf")
+        loop.call_later(0, fired.append, "zero")
+        await asyncio.sleep(0.02)
+
+    run(loop, main())
+    # NaN is treated as fire-immediately; inf never fires within the window.
+    assert "nan" in fired and "zero" in fired and "inf" not in fired
+
+
 def test_debug_flag(loop: asyncio.AbstractEventLoop) -> None:
     assert loop.get_debug() is False
     loop.set_debug(True)

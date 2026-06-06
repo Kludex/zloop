@@ -132,6 +132,16 @@ inline fn engineOf(self: *LoopObject) ?*core.Loop {
     return self.engine;
 }
 
+/// Raise RuntimeError("Event loop is closed") if the loop has been closed,
+/// matching asyncio. Returns true if closed (caller should return null).
+inline fn raiseIfClosed(self: *LoopObject) bool {
+    if (self.closed != 0) {
+        _ = py.raiseRuntime("Event loop is closed");
+        return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // scheduling
 // ---------------------------------------------------------------------------
@@ -168,6 +178,7 @@ fn extractContext(kwargs: ?*c.PyObject) py.Object {
 
 fn call_soon(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null;
     if (py.tupleSize(args) < 1) return py.raiseType("call_soon requires a callback");
     const callback = py.tupleGet(args, 0);
     if (!py.isCallable(callback)) return py.raiseType("a callable is required");
@@ -199,6 +210,7 @@ fn scheduleTimer(self: *LoopObject, when_s: f64, callback: py.Object, cb_args: p
 /// TimerHandle's when()) and in monotonic ns (for the engine), avoiding a
 /// redundant seconds->ns conversion when the caller already has ns.
 fn scheduleTimerNs(self: *LoopObject, when_s: f64, when_ns: u64, callback: py.Object, cb_args: py.Object, context: py.Object) py.Object {
+    if (raiseIfClosed(self)) return null;
     const h = makeHandle(self, callback, cb_args, context, true);
     if (h == null) return null;
     const ho: *handle.HandleObject = @ptrCast(h);
@@ -246,14 +258,15 @@ fn call_later(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) 
     // Compute the deadline once in ns from a single clock read; derive the
     // seconds form for TimerHandle.when() without a second syscall.
     const now_ns = clock.nowNs();
-    const d = @max(delay, 0);
-    const when_ns = now_ns + @as(u64, @intFromFloat(d * std.time.ns_per_s));
+    const d = if (std.math.isNan(delay)) 0 else @max(delay, 0);
+    const when_ns = now_ns +| floatToNs(d * std.time.ns_per_s);
     const when_s = @as(f64, @floatFromInt(now_ns)) / std.time.ns_per_s + d;
     return scheduleTimerNs(self, when_s, when_ns, callback, cb_args, context);
 }
 
 fn call_soon_threadsafe(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null;
     if (py.tupleSize(args) < 1) return py.raiseType("call_soon_threadsafe requires a callback");
     const callback = py.tupleGet(args, 0);
     if (!py.isCallable(callback)) return py.raiseType("a callable is required");
@@ -282,7 +295,18 @@ fn time_method(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
 
 fn secondsToNs(s: f64) u64 {
     if (s <= 0) return clock.nowNs();
-    return @intFromFloat(s * std.time.ns_per_s);
+    return floatToNs(s * std.time.ns_per_s);
+}
+
+/// Safe f64 -> u64 nanoseconds: @intFromFloat is undefined for NaN/inf or
+/// out-of-range values (a real trap under ReleaseFast), so clamp first. NaN and
+/// negatives become 0 (fire immediately); huge values saturate to maxInt.
+fn floatToNs(ns: f64) u64 {
+    if (std.math.isNan(ns) or ns <= 0) return 0;
+    // maxInt(u64) is not representable as f64; 2^64 is. Anything at/above it
+    // saturates - that is ~584 years of nanoseconds, far beyond any real timer.
+    if (ns >= 18446744073709551616.0) return std.math.maxInt(u64);
+    return @intFromFloat(ns);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +559,7 @@ fn pyIoDispose(ctx: *anyopaque) void {
 
 fn ioRegister(self_obj: ?*c.PyObject, args: ?*c.PyObject, is_writer: bool) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null;
     if (py.tupleSize(args) < 2) return py.raiseType("add_reader/add_writer(fd, callback, *args)");
     const fd_obj = py.tupleGet(args, 0);
     const fd = fdFromObject(fd_obj) orelse return null;
@@ -586,7 +611,7 @@ fn fdFromObject(o: py.Object) ?sys.fd_t {
     // accept an int fd or an object with fileno()
     if (c.PyLong_Check(o) != 0) {
         const v = py.asI64(o) orelse return null;
-        return @intCast(v);
+        return validFd(v);
     }
     const fileno = py.getAttr(o, "fileno");
     if (fileno == null) return null;
@@ -595,6 +620,17 @@ fn fdFromObject(o: py.Object) ?sys.fd_t {
     if (r == null) return null;
     defer py.decref(r);
     const v = py.asI64(r) orelse return null;
+    return validFd(v);
+}
+
+/// Validate an fd value before narrowing to fd_t (i32). @intCast would trap on
+/// negative or out-of-range values under safe builds and silently wrap under
+/// ReleaseFast; reject them with a ValueError instead.
+fn validFd(v: i64) ?sys.fd_t {
+    if (v < 0 or v > std.math.maxInt(sys.fd_t)) {
+        _ = py.raiseValue("invalid file descriptor");
+        return null;
+    }
     return @intCast(v);
 }
 
@@ -602,6 +638,7 @@ fn fdFromObject(o: py.Object) ?sys.fd_t {
 /// orchestration (create_server/create_connection) to wrap a ready socket.
 fn make_transport(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null;
     var fd_obj: ?*c.PyObject = null;
     var protocol: ?*c.PyObject = null;
     var extra: ?*c.PyObject = null;
