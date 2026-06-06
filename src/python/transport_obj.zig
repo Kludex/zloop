@@ -289,28 +289,43 @@ fn deliverBuffered(st: *State) void {
     if (r == null) reportProtocolError(st, "buffer_updated") else py.decref(r);
 }
 
-const READ_CHUNK = 64 * 1024;
+// Sized so a typical large message arrives in a single recv() (uvloop's
+// benchmark uses up to 100 KiB messages). We recv() directly into an
+// uninitialised PyBytes and shrink it to the bytes read - no stack buffer and
+// no extra copy on the read hot path.
+const READ_CHUNK = 256 * 1024;
 
 fn deliverData(st: *State) void {
-    var buf: [READ_CHUNK]u8 = undefined;
-    const n = sys.read(st.fd, &buf) catch |err| switch (err) {
-        error.WouldBlock => return,
-        error.Interrupted => return,
+    var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
+    if (data == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AS_STRING(data));
+    const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
+        error.WouldBlock, error.Interrupted => {
+            py.decref(data);
+            return;
+        },
         else => {
+            py.decref(data);
             fatalError(st, err);
             return;
         },
     };
 
     if (n == 0) {
+        py.decref(data);
         handleEof(st);
         return;
     }
 
-    const data = py.c.PyBytes_FromStringAndSize(&buf, @intCast(n));
-    if (data == null) {
-        py.c.PyErr_Clear();
-        return;
+    // Shrink the bytes object to what we actually read.
+    if (n != READ_CHUNK) {
+        if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+            py.c.PyErr_Clear();
+            return; // _PyBytes_Resize already released `data` on failure
+        }
     }
     defer py.decref(data);
 
