@@ -75,6 +75,49 @@ def test_create_connection_with_sock(loop: asyncio.AbstractEventLoop) -> None:
     assert run(loop, main()) == b"viasock"
 
 
+def test_create_connection_closes_socket_on_factory_error(loop: asyncio.AbstractEventLoop) -> None:
+    server_holder: list = []
+
+    class Srv(asyncio.Protocol):
+        def connection_made(self, t: asyncio.BaseTransport) -> None:
+            pass
+
+    def bad_factory():
+        raise RuntimeError("factory boom")
+
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+        with pytest.raises(RuntimeError, match="factory boom"):
+            await loop.create_connection(bad_factory, host, port)
+        server.close()
+        await server.wait_closed()
+        server_holder.append(server)
+
+    run(loop, main())
+
+
+def test_accepted_connection_factory_error_does_not_leak(loop: asyncio.AbstractEventLoop) -> None:
+    errors: list = []
+
+    def bad_factory():
+        raise RuntimeError("server factory boom")
+
+    async def main() -> None:
+        loop.set_exception_handler(lambda lp, ctx: errors.append(ctx))
+        server = await loop.create_server(bad_factory, "127.0.0.1", 0)
+        host, port = server.sockets[0].getsockname()
+        # connect a client; the server's protocol_factory will raise on accept
+        import socket as _s
+
+        c = _s.create_connection((host, port))
+        await asyncio.sleep(0.05)
+        c.close()
+        server.close()
+        await server.wait_closed()
+
+    run(loop, main())
+
+
 def test_create_connection_refused(loop: asyncio.AbstractEventLoop) -> None:
     # find a closed port by binding then closing
     s = socket.socket()

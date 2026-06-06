@@ -255,8 +255,17 @@ fn deliverBuffered(st: *State) void {
         reportProtocolError(st, "get_buffer");
         return;
     }
-    const dst: [*]u8 = @ptrCast(view.buf.?);
     const cap: usize = @intCast(view.len);
+    // A zero-length (or null) buffer must not be passed to read(): read(fd,_,0)
+    // returns 0, which we'd misread as EOF. asyncio treats this as a protocol
+    // error from get_buffer().
+    if (cap == 0 or view.buf == null) {
+        py.c.PyBuffer_Release(&view);
+        _ = py.raiseRuntime("get_buffer() returned an empty buffer");
+        reportProtocolError(st, "get_buffer");
+        return;
+    }
+    const dst: [*]u8 = @ptrCast(view.buf.?);
     const n = sys.read(st.fd, dst[0..cap]) catch |err| switch (err) {
         error.WouldBlock, error.Interrupted => {
             py.c.PyBuffer_Release(&view);

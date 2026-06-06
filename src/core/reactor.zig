@@ -187,6 +187,7 @@ const EpollReactor = struct {
     }
 
     fn maskOf(interest: Interest) u32 {
+        if (interest.isEmpty()) return 0; // no interest -> no RDHUP, matching kqueue
         var m: u32 = EPOLL.RDHUP;
         if (interest.read) m |= EPOLL.IN;
         if (interest.write) m |= EPOLL.OUT;
@@ -215,10 +216,14 @@ const EpollReactor = struct {
     pub fn poll(self: *EpollReactor, out: []Event, timeout_ns: ?u64) ![]Event {
         var events: [256]c.epoll_event = undefined;
         const max = @min(out.len, events.len);
-        const timeout_ms: i32 = if (timeout_ns) |ns|
-            @intCast(@min(ns / std.time.ns_per_ms, std.math.maxInt(i32)))
-        else
-            -1;
+        // Round sub-millisecond waits UP to 1ms (epoll's granularity) so a tiny
+        // timer doesn't degrade into a zero-timeout busy-poll; asyncio does the
+        // same. A literal 0ns stays 0 (intentional poll).
+        const timeout_ms: i32 = if (timeout_ns) |ns| blk: {
+            if (ns == 0) break :blk 0;
+            const ms = (ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+            break :blk @intCast(@min(ms, std.math.maxInt(i32)));
+        } else -1;
 
         const n = c.epoll_wait(self.epfd, &events, @intCast(max), timeout_ms);
         if (n < 0) {

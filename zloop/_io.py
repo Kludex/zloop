@@ -414,20 +414,28 @@ class Loop(_zloop.Loop):
 
     def _connect_accepted(self, conn: socket.socket, protocol_factory: Any, ssl: Any) -> None:
         conn.setblocking(False)
-        protocol = protocol_factory()
-        extra = _make_extra(conn, ssl if ssl else None)
-        if ssl:
-            from zloop._tls import start_tls_transport
+        # Own the socket until the transport adopts its fd; close it if protocol
+        # construction or transport setup raises, so accepted fds never leak.
+        adopted = False
+        try:
+            protocol = protocol_factory()
+            extra = _make_extra(conn, ssl if ssl else None)
+            if ssl:
+                from zloop._tls import start_tls_transport
 
-            _, waiter = start_tls_transport(self, conn, protocol, ssl, extra, server_side=True)
+                _, waiter = start_tls_transport(self, conn, protocol, ssl, extra, server_side=True)
 
-            def _log_failure(fut: asyncio.Future[None]) -> None:
-                if not fut.cancelled() and fut.exception() is not None:
-                    self.call_exception_handler({"message": "TLS handshake failed", "exception": fut.exception()})
+                def _log_failure(fut: asyncio.Future[None]) -> None:
+                    if not fut.cancelled() and fut.exception() is not None:
+                        self.call_exception_handler({"message": "TLS handshake failed", "exception": fut.exception()})
 
-            waiter.add_done_callback(_log_failure)
-        else:
-            self._make_transport(conn.fileno(), protocol, extra)
+                waiter.add_done_callback(_log_failure)
+            else:
+                self._make_transport(conn.fileno(), protocol, extra)
+            adopted = True
+        finally:
+            if not adopted:
+                conn.close()
 
     async def create_connection(
         self,
@@ -470,28 +478,37 @@ class Loop(_zloop.Loop):
         if server_hostname is None and ssl and host:
             server_hostname = host
 
-        protocol = protocol_factory()
-        extra = _make_extra(sock, ssl if ssl else None)
-        if ssl:
-            from zloop._tls import start_tls_transport
+        # Own the connected socket until the transport adopts it; close it on any
+        # failure during protocol construction / transport setup so it can't leak.
+        adopted = False
+        try:
+            protocol = protocol_factory()
+            extra = _make_extra(sock, ssl if ssl else None)
+            if ssl:
+                from zloop._tls import start_tls_transport
 
-            transport, waiter = start_tls_transport(
-                self,
-                sock,
-                protocol,
-                ssl,
-                extra,
-                server_side=False,
-                server_hostname=server_hostname,
-                ssl_handshake_timeout=ssl_handshake_timeout,
-            )
-            try:
-                await waiter
-            except BaseException:
-                transport.close()
-                raise
-        else:
-            transport = self._make_transport(sock.fileno(), protocol, extra)
+                transport, waiter = start_tls_transport(
+                    self,
+                    sock,
+                    protocol,
+                    ssl,
+                    extra,
+                    server_side=False,
+                    server_hostname=server_hostname,
+                    ssl_handshake_timeout=ssl_handshake_timeout,
+                )
+                adopted = True
+                try:
+                    await waiter
+                except BaseException:
+                    transport.close()
+                    raise
+            else:
+                transport = self._make_transport(sock.fileno(), protocol, extra)
+                adopted = True
+        finally:
+            if not adopted:
+                sock.close()
         return transport, protocol
 
     async def _sock_connect(self, sock: socket.socket, address: Any) -> None:
