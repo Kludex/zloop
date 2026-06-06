@@ -2,7 +2,7 @@
 icon: lucide/server
 ---
 
-# With uvicorn, FastAPI & HTTP clients
+# Servers & clients
 
 These all share one idea: **you pick the loop once, at the top, and everything
 underneath runs on it.** A server picks it for your whole app; a script picks it

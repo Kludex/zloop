@@ -97,7 +97,7 @@ callback scheduling, the I/O polling - was all Zig. 🎉
 
     The 30-second tour: how to actually plug zloop into your program.
 
--   :material-server-network: **[With uvicorn & FastAPI](usage/servers.md)**
+-   :material-server-network: **[Servers & clients](usage/servers.md)**
 
     ---
 

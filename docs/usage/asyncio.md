@@ -2,7 +2,7 @@
 icon: simple/python
 ---
 
-# With asyncio & AnyIO
+# asyncio, AnyIO & Trio
 
 zloop is an `asyncio.AbstractEventLoop`. Not "asyncio-like" - the real thing. So
 the asyncio APIs you reach for day to day - tasks, futures, timers, streams,
