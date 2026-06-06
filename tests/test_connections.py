@@ -107,9 +107,7 @@ def test_accepted_connection_factory_error_does_not_leak(loop: asyncio.AbstractE
         server = await loop.create_server(bad_factory, "127.0.0.1", 0)
         host, port = server.sockets[0].getsockname()
         # connect a client; the server's protocol_factory will raise on accept
-        import socket as _s
-
-        c = _s.create_connection((host, port))
+        c = socket.create_connection((host, port))
         await asyncio.sleep(0.05)
         c.close()
         server.close()

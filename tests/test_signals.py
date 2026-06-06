@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import threading
 
 import pytest
 
@@ -83,8 +84,6 @@ def test_two_signal_handlers_share_pipe(loop: asyncio.AbstractEventLoop) -> None
 
 
 def test_add_signal_handler_from_non_main_thread(loop: asyncio.AbstractEventLoop) -> None:
-    import threading
-
     error: list[BaseException] = []
 
     def worker() -> None:

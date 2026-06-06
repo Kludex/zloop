@@ -22,6 +22,7 @@ import threading
 from typing import Any
 
 from zloop import _zloop
+from zloop._tls import start_tls_transport
 
 
 class _SignalHandle:
@@ -195,7 +196,7 @@ class Loop(_zloop.Loop):
         if self._default_executor is None:
             return
         future: asyncio.Future[None] = self.create_future()
-        thread = __import__("threading").Thread(target=self._do_shutdown_executor, args=(future,))
+        thread = threading.Thread(target=self._do_shutdown_executor, args=(future,))
         thread.start()
         try:
             await future
@@ -421,8 +422,6 @@ class Loop(_zloop.Loop):
             protocol = protocol_factory()
             extra = _make_extra(conn, ssl if ssl else None)
             if ssl:
-                from zloop._tls import start_tls_transport
-
                 _, waiter = start_tls_transport(self, conn, protocol, ssl, extra, server_side=True)
 
                 def _log_failure(fut: asyncio.Future[None]) -> None:
@@ -487,8 +486,6 @@ class Loop(_zloop.Loop):
             protocol = protocol_factory()
             extra = _make_extra(sock, ssl if ssl else None)
             if ssl:
-                from zloop._tls import start_tls_transport
-
                 transport, waiter = start_tls_transport(
                     self,
                     sock,

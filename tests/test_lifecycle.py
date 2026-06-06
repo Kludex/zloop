@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import socket
+import threading
+import weakref
 
 import pytest
 
@@ -61,8 +65,6 @@ def test_close_idempotent(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def test_close_with_pending_callbacks_is_collectable() -> None:
-    import gc
-    import weakref
 
     def make() -> weakref.ref:
         lp = zloop.new_event_loop()
@@ -77,7 +79,6 @@ def test_close_with_pending_callbacks_is_collectable() -> None:
 
 
 def test_cancel_timer_after_loop_closed_and_freed() -> None:
-    import gc
 
     lp = zloop.new_event_loop()
     handle = lp.call_later(3600, lambda: None)
@@ -109,7 +110,6 @@ def test_closed_loop_rejects_scheduling(loop: asyncio.AbstractEventLoop) -> None
 
 
 def test_closed_loop_rejects_add_reader(loop: asyncio.AbstractEventLoop) -> None:
-    import socket
 
     s = socket.socket()
     loop.close()
@@ -206,7 +206,6 @@ def test_set_task_factory_must_be_callable_or_none(loop: asyncio.AbstractEventLo
 
 
 def test_call_soon_threadsafe(loop: asyncio.AbstractEventLoop) -> None:
-    import threading
 
     async def main() -> str:
         fut = loop.create_future()
@@ -236,7 +235,6 @@ def test_call_later_requires_callable(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def test_add_reader_writer(loop: asyncio.AbstractEventLoop) -> None:
-    import socket
 
     a, b = socket.socketpair()
     a.setblocking(False)
@@ -266,7 +264,6 @@ def test_add_reader_writer(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def test_remove_reader_unregistered(loop: asyncio.AbstractEventLoop) -> None:
-    import socket
 
     s = socket.socket()
 

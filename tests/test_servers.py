@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os.path
 import socket
+import tempfile
 
 import pytest
 
@@ -120,11 +122,9 @@ def test_create_server_multiple_hosts(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def test_create_unix_server(loop: asyncio.AbstractEventLoop) -> None:
-    import tempfile
-
     # AF_UNIX paths are limited to ~104 bytes, so avoid pytest's long tmp_path.
     tmpdir = tempfile.mkdtemp()
-    path = str(socket.os.path.join(tmpdir, "z.sock"))
+    path = str(os.path.join(tmpdir, "z.sock"))
 
     class Echo(asyncio.Protocol):
         def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -167,9 +167,7 @@ def test_create_unix_server_requires_path_or_sock(loop: asyncio.AbstractEventLoo
 
 
 def test_create_unix_server_with_sock_and_deferred_start(loop: asyncio.AbstractEventLoop) -> None:
-    import tempfile
-
-    path = socket.os.path.join(tempfile.mkdtemp(), "z.sock")
+    path = os.path.join(tempfile.mkdtemp(), "z.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(path)
 
