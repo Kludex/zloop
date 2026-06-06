@@ -34,22 +34,23 @@ uvicorn app:app --loop zloop:new_event_loop
 
 ## Performance
 
-Faster than uvloop on every workload measured (`bench.py`, CPython 3.14, macOS
-arm64, median of 9 isolated runs):
+Faster than uvloop on the workloads measured so far (`bench.py`, CPython 3.14,
+macOS arm64, best of several runs; figures vary run-to-run by ~10%):
 
 | workload          | asyncio | uvloop | zloop  | vs uvloop |
 |-------------------|---------|--------|--------|-----------|
-| `call_soon`       | 2.4 M/s | 4.3 M/s| 6.6 M/s| **+53%**  |
-| `call_later`      | 0.7 M/s | 3.6 M/s| 4.0 M/s| **+9%**   |
-| echo (1 KiB RTT)  | 31 k/s  | 59 k/s | 67 k/s | **+13%**  |
+| `call_soon`       | 2.4 M/s | 4.2 M/s| 6.1 M/s| **+46%**  |
+| `call_later`      | 0.6 M/s | 3.6 M/s| 4.0 M/s| **+12%**  |
+| echo (1 KiB RTT)  | ~21 k/s | 50 k/s | 58 k/s | **+16%**  |
 | `create_future`   | 0.04 M/s| 0.04 M/s| 0.04 M/s| tie      |
 
 `create_future` ties because all three reuse CPython's C-accelerated
 `_asyncio.Future`. The wins come from doing the per-callback work in Zig and
 the contextvars handling through the raw C-API (`PyContext_Enter/Exit`,
 `PyContext_CopyCurrent`) instead of Python-level `context.run()` /
-`copy_context()`, plus caching the hot asyncio callables. Numbers vary
-run-to-run; run `python bench.py` yourself.
+`copy_context()`, plus caching the hot asyncio callables. Run `python bench.py`
+(and `bench_uvloop/run_matrix.sh`) yourself; see the docs for full numbers and
+caveats.
 
 ## How it works
 

@@ -56,7 +56,7 @@ import zloop
 
 with asyncio.Runner(loop_factory=zloop.new_event_loop) as runner:
     runner.run(main())
-    runner.run(other())  # same zloop loop, reused
+    runner.run(main())  # same zloop loop, reused
 ```
 
 ## 3. Manually

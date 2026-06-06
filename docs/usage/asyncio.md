@@ -5,10 +5,30 @@ icon: simple/python
 # With asyncio
 
 zloop is an `asyncio.AbstractEventLoop`. Not "asyncio-like" - the real thing. So
-the entire `asyncio` standard-library surface works on top of it.
+the asyncio APIs you reach for day to day - tasks, futures, timers, streams,
+executors, signals, TLS - work on top of it.
 
-Let's go through the pieces you reach for most often, so you can see there are no
-surprises.
+Let's walk through them, so you can see there are no surprises. (A handful of
+lower-level loop APIs aren't implemented yet; the
+[compatibility matrix](../reference/compatibility.md) is the full picture.)
+
+!!! note "Reading the examples"
+    The first example below is complete. The later snippets show just the
+    interesting `async def main(): ...` body - run any of them by dropping it
+    into the same skeleton:
+
+    ```python
+    import asyncio
+
+    import zloop
+
+    # async def main(): ...  <- the snippet goes here
+
+    asyncio.run(main(), loop_factory=zloop.new_event_loop)  # Python 3.12+
+    ```
+
+    On Python 3.10 / 3.11, start the loop with `asyncio.Runner(loop_factory=...)`
+    instead (see [First steps](first-steps.md)); the body is unchanged.
 
 ## Tasks and futures
 
@@ -152,7 +172,8 @@ async def main():
     reader, writer = await asyncio.open_connection("example.com", 443, ssl=ctx)
     writer.write(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
     await writer.drain()
-    print((await reader.read(200)).split(b"\r\n")[0])  #> b'HTTP/1.0 200 OK' (or similar)
+    status_line = (await reader.read(200)).split(b"\r\n")[0]
+    print(status_line)  # the HTTP status line from the TLS connection
     writer.close()
 
 
@@ -161,7 +182,9 @@ asyncio.run(main(), loop_factory=zloop.new_event_loop)
 
 !!! note
     zloop reuses asyncio's own TLS state machine (`asyncio.sslproto`) on top of
-    its Zig transports - so TLS behaves identically to the default loop.
+    its Zig transports, so the handshake and record framing behave like the
+    default loop. A couple of TLS *timeout* knobs aren't wired through yet - see
+    [Compatibility](../reference/compatibility.md).
 
 ## What about the low-level loop methods?
 

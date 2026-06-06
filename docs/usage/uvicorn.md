@@ -21,8 +21,9 @@ INFO:     Started server process [12345]
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-That's the whole integration. `zloop:new_event_loop` is the same string format
-uvicorn uses for `uvloop` and `asyncio` - `module:callable`.
+That's the whole integration. `asyncio` and `uvloop` are built-in *names* in
+uvicorn; for anything else you give it an import string, `module:callable` -
+which is the path zloop uses.
 
 !!! tip "How `--loop` resolves"
     uvicorn keeps built-in names (`auto`, `asyncio`, `uvloop`). For anything

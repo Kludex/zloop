@@ -10,7 +10,7 @@ when there's work and sleeping when there isn't.
 
 ## What it owns
 
-The engine holds exactly three things plus a wakeup pipe:
+The engine's main pieces:
 
 ```mermaid
 graph TD
@@ -18,15 +18,20 @@ graph TD
     L --> RE["<b>Reactor</b><br/>fd readiness"]
     L --> TI["<b>Timer heap</b><br/>(deadline, seq) → token"]
     L --> RQ["<b>Ready queue</b><br/>FIFO of callbacks to run"]
-    L --> WP["<b>Self-pipe</b><br/>cross-thread wakeup"]
+    L --> FD["<b>fd table</b><br/>per-fd reader/writer callbacks"]
+    L --> XT["<b>Cross-thread inbox</b><br/>(lock-protected) + self-pipe"]
 ```
 
 * **Ready queue** - callbacks scheduled with `call_soon`, waiting to run.
 * **Timer heap** - a min-heap keyed by `(deadline, insertion order)`; the next
   thing to expire is always on top.
 * **Reactor** - for fd readiness, from the [previous page](reactor.md).
-* **Self-pipe** - a tiny pipe the loop watches, so another thread (or a signal)
+* **fd table** - the reader/writer callback registered for each watched fd.
+* **Cross-thread inbox** - a lock-protected queue that `call_soon_threadsafe`
+  appends to, plus a self-pipe the loop watches so another thread (or a signal)
   can wake it from a blocking `poll`.
+
+(It also keeps the running/stopping/closed state flags, of course.)
 
 ## The run-once cycle
 
@@ -45,7 +50,7 @@ flowchart TD
     C2 --> D["Release the GIL<br/>if we'll block"]
     D --> E["reactor.poll(timeout)"]
     E --> F["Re-acquire the GIL"]
-    F --> G["For each ready fd:<br/>queue its reader / writer"]
+    F --> G["For each ready fd:<br/>fire its reader / writer callback"]
     G --> H["Move every due timer<br/>into the ready queue"]
     H --> I["Run a snapshot of the<br/>ready queue, front to back"]
     I --> J([done])
@@ -70,9 +75,14 @@ Without this, threads in your `run_in_executor` pool could never run, and signal
 would never be delivered - the whole process would be frozen waiting on `poll`.
 It's easy to get wrong, and it's why a "just call epoll" loop isn't enough.
 
-### The snapshot drain
+### Inline I/O, snapshot drain for the rest
 
-When the loop runs the ready queue, it runs a **snapshot** of its current
+There are two kinds of callback, and they run differently. A ready fd's
+**native transport callback fires inline**, right there in the I/O step - that's
+how `data_received` runs without a Python round-trip. A Python-level `add_reader`
+callback, by contrast, just *enqueues* a Handle onto the ready queue.
+
+When the loop then drains the ready queue, it runs a **snapshot** of its current
 length. Callbacks that schedule *more* callbacks don't get run in the same
 iteration - they wait for the next turn. This is the exact fairness guarantee
 asyncio makes, and it prevents one chatty callback from starving I/O.

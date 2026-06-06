@@ -40,12 +40,11 @@ graph TD
     end
     subgraph adapter["CPython adapter - the only layer that #includes Python.h"]
         C["<b>Loop</b> object<br/>(implements AbstractEventLoop)"]
-        D["<b>Transport</b> object<br/>(bridges to asyncio.Protocol)"]
+        D["<b>Transport</b> object (transport_obj.zig)<br/>buffered socket I/O + flow control,<br/>bridges to asyncio.Protocol"]
         E["<b>Handle</b> / TimerHandle<br/>(wrap Python callbacks)"]
     end
     subgraph domain["Domain - pure Zig, no Python"]
         F["<b>loop.zig</b><br/>the run-once engine"]
-        G["<b>transport.zig</b> logic<br/>buffered I/O + flow control"]
     end
     subgraph platform["Platform - pure Zig"]
         H["<b>reactor.zig</b><br/>kqueue / epoll"]
@@ -58,10 +57,10 @@ graph TD
     B --> D
     C --> E
     C --> F
-    D --> G
+    D --> F
+    D --> J
     F --> H
     F --> I
-    G --> J
     H --> J
 
 ```

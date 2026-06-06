@@ -23,10 +23,12 @@ coverage):
 | **Executors** | `run_in_executor` · `set_default_executor` · `shutdown_default_executor` |
 | **Signals** | `add_signal_handler` · `remove_signal_handler` (main thread) |
 | **Errors & debug** | `call_exception_handler` · `set_exception_handler` · `get_exception_handler` · `default_exception_handler` · `set_debug` · `get_debug` |
-| **Shutdown** | `shutdown_asyncgens` · `shutdown_default_executor` |
+| **Shutdown** | `shutdown_default_executor` · `shutdown_asyncgens` (a safe no-op; zloop tracks no asyncgens) |
 | **TLS** | `create_server(ssl=...)` · `create_connection(ssl=...)` |
 
-The full asyncio **Transport** interface is implemented too - see
+The full **TCP socket Transport** interface is implemented too (`write`,
+`writelines`, `close`, `abort`, `pause_reading`/`resume_reading`, `write_eof`,
+flow-control limits, `get_extra_info`, …) - see
 [Transports](../architecture/transports.md).
 
 ## Partially supported
@@ -34,14 +36,26 @@ The full asyncio **Transport** interface is implemented too - see
 * **`create_connection`** honors `local_addr`. Some less-common parameters
   (`happy_eyeballs_delay`, `interleave`, `all_errors`) are accepted but not yet
   acted on.
+* **TLS timeouts** - `create_server(ssl=...)` / `create_connection(ssl=...)`
+  work, but a couple of the timeout knobs (`ssl_handshake_timeout` on the
+  server-accept path, `ssl_shutdown_timeout`) are accepted and not yet wired
+  through to `sslproto`.
 
 ## Not implemented
 
-* The low-level **`sock_*` coroutine helpers** (`sock_recv`, `sock_sendall`,
-  `sock_connect`, `sock_accept`, …) raise `NotImplementedError`. Most programs use
-  the higher-level streams/transports instead.
+These raise `NotImplementedError` (most are inherited `AbstractEventLoop` stubs):
+
+* The low-level **`sock_*` coroutine helpers** - `sock_recv`, `sock_recv_into`,
+  `sock_sendall`, `sock_connect`, `sock_accept`, `sock_sendfile`, … Most programs
+  use the higher-level streams/transports instead.
+* **`loop.start_tls()`** - the standalone upgrade-an-existing-transport API.
+  (Note: `create_server`/`create_connection` with `ssl=` *are* supported - this
+  is the separate `start_tls` method.)
+* **`sendfile`** (`loop.sendfile`), **`create_unix_connection`**, and
+  **`connect_accepted_socket`**.
 * **Datagram / UDP** (`create_datagram_endpoint`) and **pipes / subprocess
-  transports** are not implemented yet.
+  transports** (`connect_read_pipe`, `connect_write_pipe`, `subprocess_exec`,
+  `subprocess_shell`).
 * **Windows** - zloop is kqueue/epoll only. (`IOCP` is a different I/O model.)
 
 ## Platforms & Python versions

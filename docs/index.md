@@ -26,10 +26,13 @@ hand-written kqueue/epoll reactor in Zig, bound to CPython through a thin adapte
 
 The key features are:
 
-* **Drop-in**: it's a normal `asyncio.AbstractEventLoop`. If your code runs on
-  asyncio, it runs on zloop.
-* **Fast**: faster than uvloop on every workload we measure - scheduling,
-  timers, and socket throughput. See [Performance](reference/performance.md).
+* **Drop-in**: it's a normal `asyncio.AbstractEventLoop`. For the common
+  server/client workloads - TCP, TLS, Unix sockets, the streams and transport
+  APIs - your code runs unchanged. (A few rarely-used loop APIs aren't
+  implemented yet; see [Compatibility](reference/compatibility.md).)
+* **Fast**: on the benchmarks we've run so far, faster than uvloop at scheduling,
+  timers, and small/medium-message socket throughput. See
+  [Performance](reference/performance.md).
 * **Familiar**: works the same way uvloop does, so the tools you already know
   ([uvicorn](usage/uvicorn.md), [AnyIO](usage/anyio.md),
   [FastAPI](usage/fastapi.md)) just pick it up.
@@ -78,6 +81,11 @@ Hello from a Zig event loop 👋
 
 That's it. The coroutine ran, but the loop driving it - the timers, the
 callback scheduling, the I/O polling - was all Zig. 🎉
+
+!!! note "Python 3.12+"
+    These docs use `asyncio.run(..., loop_factory=...)`, which needs **Python
+    3.12+**. On 3.10 / 3.11 the loop works the same - you just start it
+    differently; [First steps](usage/first-steps.md) shows how.
 
 ## Where to go next
 

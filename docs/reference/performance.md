@@ -31,22 +31,16 @@ Results (macOS arm64, CPython 3.14, 3 workers, best of 3), requests/sec:
 | **10 KiB** | buffered | 105k | 105k | **124k** | **+18%** |
 | **10 KiB** | streams | 81k | 86k | **95k** | **+11%** |
 
-```mermaid
-xychart-beta
-    title "Echo throughput, requests/sec in thousands (higher is better)"
-    x-axis ["proto 1K", "buf 1K", "streams 1K", "proto 10K", "buf 10K", "streams 10K"]
-    y-axis "k req/s" 0 --> 130
-    line "uvloop" [113, 115, 90, 110, 105, 86]
-    line "zloop" [121, 123, 103, 113, 124, 95]
-```
+<figure markdown="span">
+  ![Echo throughput: uvloop vs zloop across server modes and message sizes](../assets/echo-bench.svg){ width="720" }
+  <figcaption>uvloop vs zloop, requests/sec (macOS arm64, best of 3). zloop leads
+  in every configuration, with the widest margins on streams and buffered.</figcaption>
+</figure>
 
-Both loops are plotted: the upper line is zloop, the lower line uvloop. zloop
-leads in every configuration, with the widest margins on `streams` and
-`buffered`.
-
-For the message sizes real servers live in - HTTP requests, WebSocket frames,
-RPC calls are almost always 1 to 10 KiB - **zloop beats uvloop on every cell**,
-with the biggest, most reproducible wins on the `streams` and `buffered` paths.
+For the small-to-medium messages common in HTTP requests, WebSocket frames, and
+RPC calls (1 to 10 KiB), **zloop is ahead of uvloop in every cell measured**,
+with the biggest, most reproducible margins on the `streams` and `buffered`
+paths.
 
 !!! warning "About large (100 KiB) messages"
     uvloop's benchmark also has a 100 KiB row. We don't report a winner there:
@@ -63,10 +57,12 @@ The harness lives in [`bench_uvloop/`](https://github.com/Kludex/zloop/tree/main
 $ NUM=50000 WORKERS=3 BEST_OF=3 bash bench_uvloop/run_matrix.sh
 ```
 
+(The table above used `NUM=50000`; the script's default is `100000`.)
+
 ## Micro-benchmarks
 
-Beyond echo throughput, these isolate individual loop operations (each run in its
-own process, median of several runs):
+Beyond echo throughput, these isolate individual loop operations (each in its own
+process; `bench.py` reports the best of several warmed-up runs):
 
 | Workload | asyncio | uvloop | zloop | zloop vs uvloop |
 | --- | ---: | ---: | ---: | ---: |
@@ -102,11 +98,12 @@ Python-level overhead on the hot paths:
 
 Benchmarks are easy to get wrong, so:
 
-* **Single machine, warm cache, macOS loopback.** uvloop's published "2 to 4x
-  faster than asyncio" is a *Linux* number; on macOS's loopback + kqueue stack
-  the spread is much tighter (you can see even uvloop barely beats asyncio
-  above). zloop's *relative* standing should hold on Linux, but absolute numbers
-  will differ. Run it on your own target.
+* **Single machine, warm cache, macOS loopback - no Linux numbers yet.** uvloop's
+  published "2 to 4x faster than asyncio" is a *Linux* number; on macOS's
+  loopback + kqueue stack the spread is much tighter (you can see even uvloop
+  barely beats asyncio above). We *expect* zloop's relative standing to carry to
+  Linux's epoll path, but we haven't measured it - so treat that as an
+  expectation, not a result. Run it on your own target.
 * **Run-to-run variance is real** (~10%). The 1 to 10 KiB lead is reproducible;
   exact figures wobble.
 * **Measure each metric in isolation.** Running everything back-to-back in one

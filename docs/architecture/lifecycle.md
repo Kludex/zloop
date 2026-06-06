@@ -66,10 +66,13 @@ rather than leaking an obscure internal error.
 
 ## Shutdown and cleanup
 
-`asyncio.run()` does a tidy shutdown sequence, and zloop supports all of it:
+`asyncio.run()` does a tidy shutdown sequence, and zloop participates in all of
+it:
 
 1. cancel any remaining tasks and let them finish cancelling,
-2. `await loop.shutdown_asyncgens()` - finalize async generators,
+2. `await loop.shutdown_asyncgens()` - a no-op today: zloop doesn't install
+   asyncgen finalizer hooks, so this is a compatibility placeholder (the method
+   exists and is safe to call),
 3. `await loop.shutdown_default_executor()` - drain the thread pool,
 4. `loop.close()`.
 

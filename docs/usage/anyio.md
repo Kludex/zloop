@@ -72,4 +72,7 @@ async def test_runs_on_zloop():
 
 !!! tip
     This fixture trick is the easiest way to run an *existing* asyncio/AnyIO test
-    suite on zloop to see if anything breaks. Spoiler: it shouldn't. 🙂
+    suite on zloop and see what happens. Suites that stick to TCP/TLS sockets,
+    streams, tasks, and timers should pass unchanged; if a suite reaches for
+    UDP, subprocesses, pipes, or the `sock_*` helpers it'll hit zloop's
+    [unimplemented APIs](../reference/compatibility.md). 🙂

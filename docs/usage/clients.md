@@ -4,12 +4,18 @@ icon: lucide/globe
 
 # With HTTP clients
 
-zloop is a client-side loop too. Anything that does network I/O over asyncio -
-[HTTPX](https://www.python-httpx.org), [aiohttp](https://docs.aiohttp.org),
-database drivers, message queues - runs on it.
+zloop is a client-side loop too. Libraries that do their network I/O over
+asyncio's TCP/TLS transports - [HTTPX](https://www.python-httpx.org),
+[aiohttp](https://docs.aiohttp.org), and most database drivers and message-queue
+clients - run on it.
 
 You don't configure the library. You just run your code on a zloop loop, and the
 library uses whatever loop is running.
+
+!!! note "Python 3.12+"
+    The examples use `asyncio.run(..., loop_factory=...)` (Python 3.12+). On
+    3.10 / 3.11, start the loop with `asyncio.Runner` instead - the library code
+    is identical. See [First steps](first-steps.md).
 
 ## HTTPX
 

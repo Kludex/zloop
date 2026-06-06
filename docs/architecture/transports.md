@@ -84,8 +84,11 @@ The transport implements everything asyncio (and uvicorn) expects:
 `get_protocol` · `get_extra_info` · `get_write_buffer_size` ·
 `set_write_buffer_limits` · `get_write_buffer_limits`
 
-`get_extra_info` answers the keys uvicorn asks for - `peername`, `sockname`,
-`socket`, `sslcontext`, `ssl_object` - so logging and TLS introspection work.
+`get_extra_info` answers the keys uvicorn asks for. The raw socket transport
+provides `socket`, `sockname`, `peername`, and `sslcontext` (for a TLS server).
+On a TLS connection the app-facing transport is `asyncio.sslproto`'s, which adds
+the usual `ssl_object` / `peercert` after the handshake - so logging and TLS
+introspection work.
 
 ## Two correctness details worth knowing
 
