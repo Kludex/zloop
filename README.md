@@ -57,8 +57,14 @@ CI runs these on macOS (kqueue) and Linux (epoll) across CPython 3.10-3.14.
 ## Docs
 
 Full usage and architecture docs (with diagrams) build with
-[Zensical](https://zensical.org): `scripts/build`, or `zensical serve` for a
-live preview. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design in one file.
+[Zensical](https://zensical.org): `scripts/docs` renders the site, or
+`zensical serve` for a live preview. See [ARCHITECTURE.md](ARCHITECTURE.md) for
+the design in one file.
+
+[zloop.marcelotryle.com](https://zloop.marcelotryle.com) is published to
+Cloudflare on every push to `main` (`.github/workflows/docs.yml`); pull requests
+get a versioned preview. Both need the `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` repository secrets.
 
 ## Platforms
 
