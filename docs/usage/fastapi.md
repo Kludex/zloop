@@ -29,8 +29,6 @@ async def root():
 
 Just point uvicorn at zloop's loop factory:
 
-<!-- termynal -->
-
 ```console
 $ uvicorn app:app --loop zloop:new_event_loop
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)

@@ -7,11 +7,8 @@ icon: lucide/package
 Create a [virtual environment](https://docs.python.org/3/library/venv.html), and
 install zloop into it:
 
-<!-- termynal -->
-
 ```console
 $ pip install zloop
----> 100%
 ```
 
 That's all you need to start. zloop ships as a compiled extension, so there's

@@ -38,11 +38,8 @@ The key features are:
 
 ## Installation
 
-<!-- termynal -->
-
 ```console
 $ pip install zloop
----> 100%
 ```
 
 !!! note "Requirements"
@@ -72,8 +69,6 @@ asyncio.run(main(), loop_factory=zloop.new_event_loop)  # (1)!
     Everything else is plain asyncio. That's the whole point.
 
 Run it:
-
-<!-- termynal -->
 
 ```console
 $ python main.py

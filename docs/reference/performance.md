@@ -68,8 +68,6 @@ how you can reproduce them.
 
 There's a `bench.py` in the repository:
 
-<!-- termynal -->
-
 ```console
 $ python bench.py
 metric                  asyncio    uvloop     zloop    zloop/uvloop

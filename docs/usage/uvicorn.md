@@ -15,8 +15,6 @@ zloop passes uvicorn's **entire test suite**, so it's a true drop-in.
 uvicorn's `--loop` flag accepts an import string pointing at a loop factory. Point
 it at zloop:
 
-<!-- termynal -->
-
 ```console
 $ uvicorn app:app --loop zloop:new_event_loop
 INFO:     Started server process [12345]
