@@ -5,7 +5,7 @@ icon: lucide/refresh-cw
 # The loop
 
 This is the heart: `src/core/loop.zig`. It turns the [reactor](reactor.md) and a
-timer heap into an actual *event loop* — the thing that runs forever, waking up
+timer heap into an actual *event loop* - the thing that runs forever, waking up
 when there's work and sleeping when there isn't.
 
 ## What it owns
@@ -19,14 +19,13 @@ graph TD
     L --> TI["<b>Timer heap</b><br/>(deadline, seq) → token"]
     L --> RQ["<b>Ready queue</b><br/>FIFO of callbacks to run"]
     L --> WP["<b>Self-pipe</b><br/>cross-thread wakeup"]
-    style L fill:#1a237e,color:#fff
 ```
 
-* **Ready queue** — callbacks scheduled with `call_soon`, waiting to run.
-* **Timer heap** — a min-heap keyed by `(deadline, insertion order)`; the next
+* **Ready queue** - callbacks scheduled with `call_soon`, waiting to run.
+* **Timer heap** - a min-heap keyed by `(deadline, insertion order)`; the next
   thing to expire is always on top.
-* **Reactor** — for fd readiness, from the [previous page](reactor.md).
-* **Self-pipe** — a tiny pipe the loop watches, so another thread (or a signal)
+* **Reactor** - for fd readiness, from the [previous page](reactor.md).
+* **Self-pipe** - a tiny pipe the loop watches, so another thread (or a signal)
   can wake it from a blocking `poll`.
 
 ## The run-once cycle
@@ -36,22 +35,20 @@ and it's small enough to hold in your head:
 
 ```mermaid
 flowchart TD
-    A([run_once]) --> B[Drain cross-thread inbox<br/>into the ready queue]
+    A([run_once]) --> B["Drain cross-thread inbox<br/>into the ready queue"]
     B --> C{Compute timeout}
-    C -->|ready queue non-empty| C0[timeout = 0]
-    C -->|timers pending| C1[timeout = next deadline − now]
-    C -->|nothing to do| C2[timeout = block forever]
+    C -->|ready queue non-empty| C0["timeout = 0"]
+    C -->|timers pending| C1["timeout = next deadline - now"]
+    C -->|nothing to do| C2["timeout = block forever"]
     C0 --> D
     C1 --> D
-    C2 --> D[Release the GIL<br/>if we'll block]
+    C2 --> D["Release the GIL<br/>if we'll block"]
     D --> E["reactor.poll(timeout)"]
-    E --> F[Re-acquire the GIL]
-    F --> G[For each ready fd:<br/>queue its reader / writer]
-    G --> H[Move every due timer<br/>into the ready queue]
-    H --> I[Run a <b>snapshot</b> of the<br/>ready queue, front to back]
+    E --> F["Re-acquire the GIL"]
+    F --> G["For each ready fd:<br/>queue its reader / writer"]
+    G --> H["Move every due timer<br/>into the ready queue"]
+    H --> I["Run a snapshot of the<br/>ready queue, front to back"]
     I --> J([done])
-    style D fill:#bf360c,color:#fff
-    style F fill:#bf360c,color:#fff
 ```
 
 A few things in that diagram carry real weight:
@@ -60,7 +57,7 @@ A few things in that diagram carry real weight:
 
 The loop sleeps *exactly* as long as it should. If there's already work queued,
 the timeout is `0` (don't sleep). Otherwise it's the time until the nearest
-timer. Otherwise — nothing scheduled at all — it blocks forever, until I/O or a
+timer. Otherwise - nothing scheduled at all - it blocks forever, until I/O or a
 wakeup. No busy-spinning, no oversleeping.
 
 ### Releasing the GIL :material-fire:
@@ -70,22 +67,22 @@ This is the detail that makes everything else work. While the loop is blocked in
 right after (`PyEval_RestoreThread`).
 
 Without this, threads in your `run_in_executor` pool could never run, and signals
-would never be delivered — the whole process would be frozen waiting on `poll`.
+would never be delivered - the whole process would be frozen waiting on `poll`.
 It's easy to get wrong, and it's why a "just call epoll" loop isn't enough.
 
 ### The snapshot drain
 
 When the loop runs the ready queue, it runs a **snapshot** of its current
 length. Callbacks that schedule *more* callbacks don't get run in the same
-iteration — they wait for the next turn. This is the exact fairness guarantee
+iteration - they wait for the next turn. This is the exact fairness guarantee
 asyncio makes, and it prevents one chatty callback from starving I/O.
 
 ## Dependency inversion: how Zig calls Python
 
-Here's the elegant bit. The loop engine runs callbacks — but the callbacks are
+Here's the elegant bit. The loop engine runs callbacks - but the callbacks are
 *Python* objects, and the engine is *Zig* that doesn't know Python exists. How?
 
-The engine is parameterized by a **dispatcher** — a little vtable the embedder
+The engine is parameterized by a **dispatcher** - a little vtable the embedder
 supplies:
 
 ```mermaid
@@ -98,13 +95,12 @@ graph LR
     end
     E -->|"run(token)"| D
     D -->|"executes the Python Handle"| H["Handle._run()"]
-    style zig fill:#1a237e,color:#fff
 ```
 
-* `run(token)` — execute the callback identified by `token`. The adapter knows
+* `run(token)` - execute the callback identified by `token`. The adapter knows
   `token` is really a pointer to a Python `Handle`, and runs it.
-* `drop(token)` — release a callback that will never run (e.g. on shutdown).
-* `suspend` / `resume` — the GIL release/re-acquire around the blocking poll.
+* `drop(token)` - release a callback that will never run (e.g. on shutdown).
+* `suspend` / `resume` - the GIL release/re-acquire around the blocking poll.
 
 The engine just calls `dispatcher.run(token)`. It has no idea a Python function
 is on the other end. That's **dependency inversion**: the pure domain defines the
@@ -114,7 +110,7 @@ is on the other end. That's **dependency inversion**: the pure domain defines th
     Deferred callbacks (`call_soon`, timers) go through the dispatcher as opaque
     tokens → Python Handles. But **I/O readiness** callbacks (a transport's
     "you can read now") are *native Zig closures* registered directly with the
-    engine — so socket I/O never makes a round trip through Python just to find
+    engine - so socket I/O never makes a round trip through Python just to find
     out a byte arrived. The Python `add_reader` wrapper installs a closure that
     simply enqueues a Handle. Best of both.
 

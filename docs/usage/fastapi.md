@@ -6,7 +6,7 @@ icon: simple/fastapi
 
 [FastAPI](https://fastapi.tiangolo.com) and
 [Starlette](https://www.starlette.io) are ASGI applications. They don't run a
-loop themselves — the **server** does (that's [uvicorn](uvicorn.md)). So
+loop themselves - the **server** does (that's [uvicorn](uvicorn.md)). So
 "using zloop with FastAPI" really means "run your FastAPI app with uvicorn on
 zloop".
 
@@ -53,14 +53,13 @@ graph LR
     B --> C[AnyIO]
     C --> D[asyncio]
     D --> E[zloop loop]
-    style E fill:#5e35b1,color:#fff
 ```
 
-FastAPI is built on Starlette, Starlette on AnyIO, AnyIO on asyncio — and the
+FastAPI is built on Starlette, Starlette on AnyIO, AnyIO on asyncio - and the
 asyncio loop, at the very bottom, is the one uvicorn created for you: **zloop**.
 
 Each layer only ever asks for "the running loop". Swap the loop at the bottom and
-the entire stack runs on it, untouched. That's the beauty of asyncio's design —
+the entire stack runs on it, untouched. That's the beauty of asyncio's design -
 and the reason a drop-in loop like zloop is even possible. 🙂
 
 !!! tip "Want to verify it's actually zloop?"

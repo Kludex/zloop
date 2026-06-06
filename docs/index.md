@@ -5,7 +5,7 @@ icon: lucide/zap
 # zloop
 
 <p align="center">
-    <em>An asyncio event loop with a Zig core — a drop-in, faster-than-uvloop alternative.</em>
+    <em>An asyncio event loop with a Zig core - a drop-in, faster-than-uvloop alternative.</em>
 </p>
 
 ---
@@ -28,7 +28,7 @@ The key features are:
 
 * **Drop-in**: it's a normal `asyncio.AbstractEventLoop`. If your code runs on
   asyncio, it runs on zloop.
-* **Fast**: faster than uvloop on every workload we measure — scheduling,
+* **Fast**: faster than uvloop on every workload we measure - scheduling,
   timers, and socket throughput. See [Performance](reference/performance.md).
 * **Familiar**: works the same way uvloop does, so the tools you already know
   ([uvicorn](usage/uvicorn.md), [AnyIO](usage/anyio.md),
@@ -64,7 +64,7 @@ asyncio.run(main(), loop_factory=zloop.new_event_loop)  # (1)!
 ```
 
 1.  This is the one line that matters. `loop_factory` tells `asyncio.run()`
-    *which* loop to build — and `zloop.new_event_loop` builds a zloop one.
+    *which* loop to build - and `zloop.new_event_loop` builds a zloop one.
 
     Everything else is plain asyncio. That's the whole point.
 
@@ -76,8 +76,8 @@ $ python main.py
 Hello from a Zig event loop 👋
 ```
 
-That's it. The coroutine ran, but the loop driving it — the timers, the
-callback scheduling, the I/O polling — was all Zig. 🎉
+That's it. The coroutine ran, but the loop driving it - the timers, the
+callback scheduling, the I/O polling - was all Zig. 🎉
 
 ## Where to go next
 

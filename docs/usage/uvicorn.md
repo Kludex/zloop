@@ -5,7 +5,7 @@ icon: lucide/server
 # With uvicorn
 
 [uvicorn](https://www.uvicorn.org) is probably *the* reason you're here. It's the
-ASGI server that runs FastAPI, Starlette, and friends — and it lets you choose
+ASGI server that runs FastAPI, Starlette, and friends - and it lets you choose
 the event loop it runs on.
 
 zloop passes uvicorn's **entire test suite**, so it's a true drop-in.
@@ -22,7 +22,7 @@ INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
 That's the whole integration. `zloop:new_event_loop` is the same string format
-uvicorn uses for `uvloop` and `asyncio` — `module:callable`.
+uvicorn uses for `uvloop` and `asyncio` - `module:callable`.
 
 !!! tip "How `--loop` resolves"
     uvicorn keeps built-in names (`auto`, `asyncio`, `uvloop`). For anything
@@ -59,7 +59,7 @@ with `--loop zloop:new_event_loop`.
 
 ## Does everything work?
 
-Yes — this is the part we're most confident about, because it's continuously
+Yes - this is the part we're most confident about, because it's continuously
 verified:
 
 * HTTP/1.1 (both the `h11` and `httptools` protocols)
@@ -69,5 +69,5 @@ verified:
 * Graceful shutdown and signal handling
 * The `--workers` multiprocess model
 
-zloop runs uvicorn's full suite — **1048 tests** — with the same result as the
+zloop runs uvicorn's full suite - **1048 tests** - with the same result as the
 default asyncio loop. If uvicorn works for you on asyncio, it works on zloop.

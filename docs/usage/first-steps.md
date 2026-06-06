@@ -13,7 +13,7 @@ zloop.new_event_loop  # a callable that returns a fresh zloop event loop
 ```
 
 A *loop factory* is just a function that returns a new event loop. asyncio uses
-this concept everywhere — and so, to use zloop, you hand this factory to whatever
+this concept everywhere - and so, to use zloop, you hand this factory to whatever
 is in charge of creating the loop.
 
 Let's see the three ways that come up in practice.
@@ -41,7 +41,7 @@ print(asyncio.run(main(), loop_factory=zloop.new_event_loop))  # (1)!
 
 !!! tip
     `loop_factory` is the cleanest hook there is. No global state, no policies,
-    no side effects — just "build the loop with *this*".
+    no side effects - just "build the loop with *this*".
 
 ## 2. With `asyncio.Runner` (Python 3.11+)
 
@@ -78,7 +78,7 @@ finally:
 
 1.  Always `close()` the loop when you're done. This releases the loop's
     resources (and lets it be garbage-collected cleanly). `asyncio.run()` and
-    `Runner` do this for you — which is one more reason to prefer them.
+    `Runner` do this for you - which is one more reason to prefer them.
 
 ## It's just asyncio
 
@@ -92,7 +92,7 @@ import zloop
 
 
 async def main():
-    # get the running loop — it's a zloop loop, but you don't care
+    # get the running loop - it's a zloop loop, but you don't care
     loop = asyncio.get_running_loop()
 
     # schedule a callback
@@ -109,7 +109,7 @@ async def main():
 asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ```
 
-`asyncio.sleep`, `asyncio.gather`, `call_later`, `get_running_loop` — all of it
+`asyncio.sleep`, `asyncio.gather`, `call_later`, `get_running_loop` - all of it
 works, because zloop *is* an asyncio loop. The Zig core is an implementation
 detail you opted into with one argument. 🙂
 

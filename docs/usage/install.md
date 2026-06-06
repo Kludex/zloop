@@ -24,7 +24,7 @@ zloop is a CPython extension with a Zig core. It needs:
 !!! info "Why those platforms?"
     The event loop's I/O engine talks directly to the operating system's
     readiness API. On macOS and the BSDs that's `kqueue`; on Linux it's
-    `epoll`. Windows isn't supported (yet) — `IOCP` is a different model.
+    `epoll`. Windows isn't supported (yet) - `IOCP` is a different model.
 
 ## Verifying the install
 
@@ -40,7 +40,7 @@ asyncio.run(asyncio.sleep(0), loop_factory=zloop.new_event_loop)
 print("zloop works ✨")
 ```
 
-1.  This prints something like `<zloop.Loop object at 0x...>` — a real
+1.  This prints something like `<zloop.Loop object at 0x...>` - a real
     `asyncio.AbstractEventLoop` instance, backed by Zig.
 
 If that runs without errors, you're ready. Head to [First steps](first-steps.md).

@@ -8,7 +8,7 @@ A recurring question: *if zloop is a "from-scratch event loop in Zig", why does
 it import `asyncio` at all?*
 
 Because rewriting code that CPython already gets right would be reckless, not
-impressive. The art is drawing the boundary in the right place — and that
+impressive. The art is drawing the boundary in the right place - and that
 boundary is the same one uvloop draws.
 
 ## The rule
@@ -32,35 +32,33 @@ graph TD
         I["ThreadPoolExecutor<br/>(run_in_executor)"]
         J["socket.getaddrinfo<br/>(DNS, via a thread)"]
     end
-    style zig fill:#004d40,color:#fff
-    style reuse fill:#1a237e,color:#fff
 ```
 
 ## Why reuse each of these?
 
 ### `Future` and `Task`
 
-Stepping a coroutine correctly — cancellation, exception propagation, `contextvars`
-context, chaining — is genuinely subtle, and CPython's `_asyncio` implements it in
+Stepping a coroutine correctly - cancellation, exception propagation, `contextvars`
+context, chaining - is genuinely subtle, and CPython's `_asyncio` implements it in
 C. uvloop reuses it. zloop reuses it. `loop.create_future()` returns a real
 `asyncio.Future`; `loop.create_task()` returns a real `asyncio.Task`.
 
 !!! quote
     This is also why `create_future` benchmarks identically across asyncio,
     uvloop, and zloop: all three are calling the *same* C-accelerated object.
-    There's nothing to "win" there — and reimplementing it would only add bugs.
+    There's nothing to "win" there - and reimplementing it would only add bugs.
 
 ### `asyncio.sslproto`
 
 TLS is a state machine wrapped around a buffered protocol. asyncio's
-`SSLProtocol` is pure Python, loop-agnostic, and battle-tested — it only needs a
+`SSLProtocol` is pure Python, loop-agnostic, and battle-tested - it only needs a
 loop with `call_soon`/`call_later` and a transport to drive. zloop gives it
 exactly that, by feeding it ciphertext through a Zig transport. So TLS behaves
 *identically* to the default loop, with zero TLS code in zloop itself.
 
 ### Executors and DNS
 
-`run_in_executor` wraps a `concurrent.futures` pool — no reason to reinvent
+`run_in_executor` wraps a `concurrent.futures` pool - no reason to reinvent
 thread pools. And `getaddrinfo` is blocking, so DNS resolution is dispatched to a
 thread through that same executor. Standard asyncio strategy.
 

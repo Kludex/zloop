@@ -4,7 +4,7 @@ icon: lucide/radar
 
 # The reactor
 
-At the very bottom of zloop sits the **reactor** — the piece that asks the
+At the very bottom of zloop sits the **reactor** - the piece that asks the
 operating system *"which of these sockets are ready?"* and waits efficiently
 until at least one is.
 
@@ -23,10 +23,9 @@ graph LR
     R["<b>Reactor</b><br/>register · modify ·<br/>unregister · poll"]
     R -->|macOS / BSD| K["kqueue"]
     R -->|Linux| E["epoll"]
-    style R fill:#004d40,color:#fff
 ```
 
-The right backend is chosen at **compile time** from the target OS — there's no
+The right backend is chosen at **compile time** from the target OS - there's no
 runtime branching.
 
 ## The API
@@ -42,13 +41,13 @@ The whole reactor is four operations:
 
 A few design choices worth calling out:
 
-* **`interest`** is a tiny bitset — `{ read, write }`. That's all the loop ever
+* **`interest`** is a tiny bitset - `{ read, write }`. That's all the loop ever
   needs to express.
 * **`token`** is an opaque `usize` the caller hands in. The reactor stores it and
   hands it straight back in the readiness event. The reactor never interprets it.
   (The loop uses the fd itself as the token, so it can find the fd's state fast.)
 * **`poll`** writes results into a caller-provided buffer and returns the slice
-  that was filled — no allocation in the hot path.
+  that was filled - no allocation in the hot path.
 
 ## What `poll` gives back
 
@@ -59,7 +58,7 @@ pub const Event = struct {
     token: usize,    // whatever you registered
     readable: bool,  // ready to read
     writable: bool,  // ready to write
-    hup: bool,       // peer hung up, or an error — let reads/writes observe it
+    hup: bool,       // peer hung up, or an error - let reads/writes observe it
 };
 ```
 
@@ -76,7 +75,7 @@ than silently doing nothing. So a hangup is reported as "go look at this fd".
 * `n` → block up to `n` nanoseconds
 
 The loop computes this timeout from the nearest timer (see
-[The loop](the-loop.md)) so it sleeps exactly as long as it should — no busy
+[The loop](the-loop.md)) so it sleeps exactly as long as it should - no busy
 spinning, no oversleeping.
 
 !!! info "kqueue vs epoll subtleties"
@@ -87,12 +86,12 @@ spinning, no oversleeping.
       dropping all interest deletes both. **epoll** uses a single event mask, so
       zloop maps "no interest" to a zero mask (no stray hangup notifications).
     * **epoll**'s timeout is in milliseconds, so sub-millisecond waits are
-      rounded *up* to 1ms — exactly what asyncio does — to avoid degrading into a
+      rounded *up* to 1ms - exactly what asyncio does - to avoid degrading into a
       zero-timeout busy-poll.
 
 ## Tested in isolation
 
-Because the reactor has no Python in it, it's tested as plain Zig — with real
+Because the reactor has no Python in it, it's tested as plain Zig - with real
 pipes and socket pairs:
 
 ```console

@@ -6,7 +6,7 @@ icon: lucide/git-merge
 
 [AnyIO](https://anyio.readthedocs.io) is the structured-concurrency layer that
 sits on top of asyncio (and Trio). It's what Starlette, FastAPI, and HTTPX use
-internally — so making AnyIO run on zloop means a *lot* of the ecosystem runs on
+internally - so making AnyIO run on zloop means a *lot* of the ecosystem runs on
 zloop.
 
 The good news: AnyIO's asyncio backend accepts a **loop factory**, so this is a
@@ -42,7 +42,7 @@ print(
 ## In tests (`pytest` + `anyio`)
 
 If you test with the `anyio` pytest plugin, you select the backend with the
-`anyio_backend` fixture. Return a tuple to pass options — including the loop
+`anyio_backend` fixture. Return a tuple to pass options - including the loop
 factory:
 
 ```python title="conftest.py"
@@ -60,13 +60,13 @@ def anyio_backend():
     exactly how we run uvicorn's own test suite against zloop.
 
 ```python title="test_something.py"
+import asyncio
+
 import pytest
 
 
 @pytest.mark.anyio
 async def test_runs_on_zloop():
-    import asyncio
-
     assert type(asyncio.get_running_loop()).__module__.startswith("zloop")
 ```
 

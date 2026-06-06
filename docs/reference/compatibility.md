@@ -26,7 +26,7 @@ coverage):
 | **Shutdown** | `shutdown_asyncgens` · `shutdown_default_executor` |
 | **TLS** | `create_server(ssl=...)` · `create_connection(ssl=...)` |
 
-The full asyncio **Transport** interface is implemented too — see
+The full asyncio **Transport** interface is implemented too - see
 [Transports](../architecture/transports.md).
 
 ## Partially supported
@@ -42,7 +42,7 @@ The full asyncio **Transport** interface is implemented too — see
   the higher-level streams/transports instead.
 * **Datagram / UDP** (`create_datagram_endpoint`) and **pipes / subprocess
   transports** are not implemented yet.
-* **Windows** — zloop is kqueue/epoll only. (`IOCP` is a different I/O model.)
+* **Windows** - zloop is kqueue/epoll only. (`IOCP` is a different I/O model.)
 
 ## Platforms & Python versions
 
@@ -56,6 +56,6 @@ The full asyncio **Transport** interface is implemented too — see
 !!! note "A word on honesty"
     This page lists what *isn't* done as plainly as what is. zloop's goal is to be
     a trustworthy drop-in for the common case (ASGI servers, HTTP clients,
-    structured concurrency) — not to claim 100% of asyncio's surface on day one.
+    structured concurrency) - not to claim 100% of asyncio's surface on day one.
     If you hit a gap that matters to you,
     [open an issue](https://github.com/Kludex/zloop).

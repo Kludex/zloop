@@ -39,26 +39,26 @@ the way asyncio does:
 sequenceDiagram
     participant U as Your code
     participant L as Loop
-    participant F as Future/Task
-    participant E as Engine (Zig)
+    participant F as Task
+    participant E as Engine
 
-    U->>L: run_until_complete(coro)
-    L->>F: ensure_future(coro)  (a Task)
-    L->>F: add_done_callback(→ stop)
-    L->>E: run_forever()
+    U->>L: run_until_complete coro
+    L->>F: ensure_future wraps it in a Task
+    L->>F: add_done_callback that calls stop
+    L->>E: run_forever
     loop until stopping
-        E->>E: run_once()
+        E->>E: run_once
         E-->>F: steps the coroutine
     end
-    F-->>L: done → callback calls stop()
+    F-->>L: done, callback calls stop
     E-->>L: run_forever returns
-    L->>F: return future.result()
-    L-->>U: result (or raised exception)
+    L->>F: return future.result
+    L-->>U: result or raised exception
 ```
 
 The trick is the done-callback: when the wrapped task finishes, it calls
 `loop.stop()`, which breaks the `run_forever` loop. Then `run_until_complete`
-returns the task's result — or re-raises its exception.
+returns the task's result - or re-raises its exception.
 
 If the loop is stopped *before* the future completes, zloop raises a clear
 `RuntimeError("Event loop stopped before Future completed.")`, matching asyncio
@@ -69,18 +69,18 @@ rather than leaking an obscure internal error.
 `asyncio.run()` does a tidy shutdown sequence, and zloop supports all of it:
 
 1. cancel any remaining tasks and let them finish cancelling,
-2. `await loop.shutdown_asyncgens()` — finalize async generators,
-3. `await loop.shutdown_default_executor()` — drain the thread pool,
+2. `await loop.shutdown_asyncgens()` - finalize async generators,
+3. `await loop.shutdown_default_executor()` - drain the thread pool,
 4. `loop.close()`.
 
 That last `close()` does something important for memory: it **drops the engine's
-pending callbacks and timers**. This breaks a reference cycle — the engine holds
-pending callback handles, and each handle holds a reference back to the loop — so
+pending callbacks and timers**. This breaks a reference cycle - the engine holds
+pending callback handles, and each handle holds a reference back to the loop - so
 that once you're done, the loop can be garbage-collected cleanly.
 
 !!! tip "Always close your loop"
     If you create a loop by hand, `close()` it when you're done (a `try/finally`
-    is the idiom). `asyncio.run()` and `asyncio.Runner` do this for you — which is
+    is the idiom). `asyncio.run()` and `asyncio.Runner` do this for you - which is
     why they're the recommended way to run things. A loop that's *abandoned*
     without being closed, while callbacks are still pending, can't break that
     cycle and will leak.
@@ -89,7 +89,7 @@ that once you're done, the loop can be garbage-collected cleanly.
 
 A closed loop is inert and says so. Calling `call_soon`, `call_later`,
 `add_reader`, or `create_server` on a closed loop raises
-`RuntimeError("Event loop is closed")` — exactly like asyncio. No silent enqueuing
+`RuntimeError("Event loop is closed")` - exactly like asyncio. No silent enqueuing
 onto a loop that will never run again.
 
 ```python

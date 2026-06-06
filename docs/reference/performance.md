@@ -4,78 +4,105 @@ icon: lucide/gauge
 
 # Performance
 
-zloop is faster than uvloop on every workload we measure where the loop
-implementation actually differs. Here are the numbers — and, just as importantly,
-the methodology and the caveats.
+zloop is faster than uvloop on the workloads that matter most for real servers.
+This page leads with uvloop's *own* benchmark (the fairest comparison there is),
+then shows lower-level micro-benchmarks, and is honest about the caveats.
 
-## The numbers
+## uvloop's own benchmark
 
-Measured on CPython 3.14, macOS arm64, each metric run in isolation, reported as
-the median of several runs:
+The most credible way to compare against uvloop is to run *uvloop's* benchmark.
+So that's what we do: uvloop ships an echo-server benchmark in
+[`examples/bench`](https://github.com/MagicStack/uvloop/tree/master/examples/bench),
+with three server styles - `proto` (a raw `asyncio.Protocol`), `buffered` (a
+`BufferedProtocol`), and `streams` (the high-level streams API) - driven by a
+multi-process client that measures requests/second.
 
-| Workload | asyncio | uvloop | zloop | zloop vs uvloop |
-| --- | --- | --- | --- | --- |
-| `call_soon` (schedule + run) | 2.4 M/s | 4.2 M/s | **6.1 M/s** | **+46%** |
-| `call_later` (timers) | 0.6 M/s | 3.6 M/s | **4.0 M/s** | **+12%** |
-| echo (1 KiB round-trip) | ~21 k/s | 49.8 k/s | **57.7 k/s** | **+16%** |
-| `create_future` | ~0.04 M/s | ~0.04 M/s | ~0.04 M/s | tie |
+We run it unchanged, except for adding a `--zloop` flag to the server that
+mirrors the existing `--uvloop` one. The client is byte-for-byte uvloop's.
 
-`create_future` is a genuine tie because all three loops reuse CPython's
-C-accelerated `asyncio.Future` — there's nothing there to differentiate. See
-[What zloop reuses](../architecture/reuse.md).
+Results (macOS arm64, CPython 3.14, 3 workers, best of 3), requests/sec:
+
+| Message | Server mode | asyncio | uvloop | zloop | zloop vs uvloop |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **1 KiB** | proto | 113k | 113k | **121k** | **+7%** |
+| **1 KiB** | buffered | 115k | 115k | **123k** | **+7%** |
+| **1 KiB** | streams | 83k | 90k | **103k** | **+14%** |
+| **10 KiB** | proto | 105k | 110k | **113k** | **+3%** |
+| **10 KiB** | buffered | 105k | 105k | **124k** | **+18%** |
+| **10 KiB** | streams | 81k | 86k | **95k** | **+11%** |
 
 ```mermaid
 xychart-beta
-    title "zloop vs uvloop (×, higher is better for zloop)"
-    x-axis ["call_soon", "call_later", "echo", "create_future"]
-    y-axis "zloop / uvloop" 0 --> 1.6
-    bar [1.46, 1.12, 1.16, 1.00]
+    title "Echo throughput, zloop / uvloop (higher favors zloop)"
+    x-axis ["proto 1K", "buf 1K", "streams 1K", "proto 10K", "buf 10K", "streams 10K"]
+    y-axis "ratio" 0 --> 1.3
+    bar [1.07, 1.07, 1.14, 1.03, 1.18, 1.11]
 ```
+
+For the message sizes real servers live in - HTTP requests, WebSocket frames,
+RPC calls are almost always 1 to 10 KiB - **zloop beats uvloop on every cell**,
+with the biggest, most reproducible wins on the `streams` and `buffered` paths.
+
+!!! warning "About large (100 KiB) messages"
+    uvloop's benchmark also has a 100 KiB row. We don't report a winner there:
+    at that size the test measures *loopback bandwidth*, not the event loop, and
+    the numbers swing wildly between runs for all three loops (we saw asyncio's
+    streams read 42k one run and 24k the next). To measure large-message
+    behavior meaningfully you need real hardware, not loopback.
+
+### Reproduce it
+
+The harness lives in [`bench_uvloop/`](https://github.com/Kludex/zloop/tree/main/bench_uvloop):
+
+```console
+$ NUM=50000 WORKERS=3 BEST_OF=3 bash bench_uvloop/run_matrix.sh
+```
+
+## Micro-benchmarks
+
+Beyond echo throughput, these isolate individual loop operations (each run in its
+own process, median of several runs):
+
+| Workload | asyncio | uvloop | zloop | zloop vs uvloop |
+| --- | ---: | ---: | ---: | ---: |
+| `call_soon` (schedule + run) | 2.4 M/s | 4.2 M/s | **6.1 M/s** | **+46%** |
+| `call_later` (timers) | 0.6 M/s | 3.6 M/s | **4.0 M/s** | **+12%** |
+| `create_future` | ~0.04 M/s | ~0.04 M/s | ~0.04 M/s | tie |
+
+`create_future` is a genuine tie because all three loops reuse CPython's
+C-accelerated `asyncio.Future` - there's nothing there to differentiate. See
+[What zloop reuses](../architecture/reuse.md).
+
+Reproduce with `python bench.py` in the repository.
 
 ## Where the speed comes from
 
-It's not magic — it's doing the per-callback work in Zig and avoiding
+It's not magic, it's doing the per-callback work in Zig and avoiding
 Python-level overhead on the hot paths:
 
 * **The contextvars work goes through the raw C-API** (`PyContext_Enter` /
   `PyContext_Exit` / `PyContext_CopyCurrent`) instead of the Python-level
   `context.run()` and `contextvars.copy_context()`. This was the single biggest
   win for timers and scheduling.
+* **Reads are zero-copy**: a socket read goes straight into a freshly allocated
+  `bytes` object that's then shrunk to size, with no intermediate buffer copy.
 * **The hot asyncio callables are cached** (`Future`, `Task`, `ensure_future`)
   instead of being re-imported on every call.
-* **I/O readiness callbacks are native Zig closures** — a socket becoming
+* **I/O readiness callbacks are native Zig closures** - a socket becoming
   readable doesn't make a round trip through Python just to learn a byte arrived.
 * **The timer heap and ready queue live in Zig**, with no per-operation Python
   allocation.
 
-## Methodology & caveats
+## Caveats, stated plainly
 
-Benchmarks are easy to get wrong, so here's exactly how these were taken — and
-how you can reproduce them.
+Benchmarks are easy to get wrong, so:
 
-!!! warning "Read this before quoting the numbers"
-    * **Single machine, warm cache.** These are not from a controlled benchmark
-      rig. Treat the ratios as "consistently ahead", not as exact constants.
-    * **Run-to-run variance is real** (~±10%). The lead is reproducible across
-      runs; the exact figures wobble.
-    * **Measure each metric in isolation.** Running all metrics back-to-back in
-      one process degrades the later ones (allocator state, warmup) and produces
-      misleading ratios — we've seen echo read anywhere from 0.93× to 1.16×
-      depending on what ran before it. The isolated, per-metric medians are the
-      trustworthy ones.
-
-## Reproduce it
-
-There's a `bench.py` in the repository:
-
-```console
-$ python bench.py
-metric                  asyncio    uvloop     zloop    zloop/uvloop
-------------------------------------------------------------------
-call_soon (M/s)            2.4       4.2       6.1           1.46x
-call_later (M/s)           0.6       3.6       4.0           1.12x
-echo req/s (k)            21.0      49.8      57.7           1.16x
-create_future (M/s)        0.0       0.0       0.0           1.00x
-```
-
-Run it on your own hardware — that's the number that matters for *you*. 🙂
+* **Single machine, warm cache, macOS loopback.** uvloop's published "2 to 4x
+  faster than asyncio" is a *Linux* number; on macOS's loopback + kqueue stack
+  the spread is much tighter (you can see even uvloop barely beats asyncio
+  above). zloop's *relative* standing should hold on Linux, but absolute numbers
+  will differ. Run it on your own target.
+* **Run-to-run variance is real** (~10%). The 1 to 10 KiB lead is reproducible;
+  exact figures wobble.
+* **Measure each metric in isolation.** Running everything back-to-back in one
+  process degrades the later measurements and produces misleading ratios.
