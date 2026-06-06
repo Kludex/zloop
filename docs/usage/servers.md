@@ -166,11 +166,6 @@ connection pooling, timeouts: all handled by zloop's transports under the hood.
 aiohttp is the same story - run it on a zloop loop and its `ClientSession` uses it
 automatically.
 
-!!! note "Python 3.12+"
-    The example uses `asyncio.run(..., loop_factory=...)` (Python 3.12+). On
-    3.10 / 3.11, start the loop with `asyncio.Runner` instead - the library code
-    is identical. See [First steps](first-steps.md).
-
 ## The general pattern
 
 This is the recurring theme, and it's worth saying once clearly:

@@ -46,7 +46,7 @@ $ pip install zloop
 ```
 
 !!! note "Requirements"
-    zloop needs **CPython 3.10+** and runs on **macOS / BSD** (kqueue) and
+    zloop needs **CPython 3.12+** and runs on **macOS / BSD** (kqueue) and
     **Linux** (epoll).
 
 ## Example

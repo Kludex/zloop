@@ -62,7 +62,7 @@ These raise `NotImplementedError` (most are inherited `AbstractEventLoop` stubs)
 
 | | |
 | --- | --- |
-| **Python** | CPython 3.10+ |
+| **Python** | CPython 3.12+ |
 | **macOS / BSD** | ✅ via `kqueue` |
 | **Linux** | ✅ via `epoll` |
 | **Windows** | ❌ not supported |

@@ -18,7 +18,7 @@ nothing to configure and no system libraries to install.
 
 zloop is a CPython extension with a Zig core. It needs:
 
-* **CPython 3.10 or higher**
+* **CPython 3.12 or higher**
 * **macOS / BSD** (using `kqueue`) or **Linux** (using `epoll`)
 
 !!! info "Why those platforms?"

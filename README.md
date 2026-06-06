@@ -68,4 +68,4 @@ get a versioned preview. Both need the `CLOUDFLARE_API_TOKEN` and
 
 ## Platforms
 
-macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.10+. MIT licensed.
+macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.12+. MIT licensed.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -10,6 +11,23 @@ from typing import Any
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 ROOT = Path(__file__).parent
+
+
+def _zig_command() -> list[str]:
+    """Resolve how to invoke Zig: a `zig` on PATH, else the `ziglang` pip package.
+
+    The pip fallback (`python -m ziglang`) works identically on the host and inside
+    cibuildwheel's manylinux containers, where a host-installed `zig` isn't visible.
+    """
+    if shutil.which("zig"):
+        return ["zig"]
+    try:
+        import ziglang  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "Zig toolchain not found: install Zig and put it on PATH, or `pip install ziglang`."
+        ) from None
+    return [sys.executable, "-m", "ziglang"]
 
 
 class ZigBuildHook(BuildHookInterface):
@@ -34,7 +52,7 @@ class ZigBuildHook(BuildHookInterface):
         mode = os.environ.get("ZLOOP_BUILD_MODE", "ReleaseFast")
         env = {**os.environ, "ZLOOP_PYTHON_INCLUDE": include, "ZLOOP_EXT_SUFFIX": ext_suffix}
         subprocess.run(
-            ["zig", "build", f"-Doptimize={mode}"],
+            [*_zig_command(), "build", f"-Doptimize={mode}"],
             cwd=ROOT,
             env=env,
             check=True,

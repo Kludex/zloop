@@ -19,6 +19,10 @@ const DEFAULT_HIGH_WATER: usize = 64 * 1024;
 pub const TransportObject = extern struct {
     ob_base: c.PyObject,
     state: ?*State,
+    // Explicit instance __dict__. A member literally named "__dict__" makes
+    // PyType_FromSpec wire up tp_dictoffset, which works on every supported
+    // CPython; the managed-dict C-API (PyObject_*ManagedDict) only exists on 3.13+.
+    dict: py.Object,
 };
 
 /// All the non-POD transport state, heap-allocated so the Python object stays a
@@ -74,14 +78,14 @@ fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
     // attribute lookup), preserving the callback's exception across the exit.
     if (py.c.PyContext_Enter(st.context) != 0) return null;
     const result = py.callOneArg(m, arg);
-    const exc = py.c.PyErr_GetRaisedException();
+    const exc = py.fetchException();
     if (py.c.PyContext_Exit(st.context) != 0) {
         if (exc != null) py.decref(exc);
         py.xdecref(result);
         return null;
     }
     if (exc != null) {
-        py.c.PyErr_SetRaisedException(exc);
+        py.restoreException(exc);
         return null;
     }
     return result;
@@ -135,8 +139,9 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     // they make) inherit contextvars set by the caller.
     st.context = captureContext();
     t.state = st;
-    // tp_alloc already GC-tracks managed-dict instances on 3.12+, so we must not
-    // track again here (double-track is a fatal assertion).
+    t.dict = null; // tp_alloc zero-fills, but be explicit about the __dict__ slot.
+    // tp_alloc already GC-tracks GC instances, so we must not track again here
+    // (double-track is a fatal assertion).
 
     // connection_made(transport) under the captured context, then begin
     // reading (selector transports deliver connection_made before first read).
@@ -301,7 +306,7 @@ fn deliverData(st: *State) void {
         py.c.PyErr_Clear();
         return;
     }
-    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AS_STRING(data));
+    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
     const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
         error.WouldBlock, error.Interrupted => {
             py.decref(data);
@@ -559,7 +564,7 @@ fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv
 }
 
 fn reportProtocolError(st: *State, where: [*c]const u8) void {
-    const exc = py.c.PyErr_GetRaisedException();
+    const exc = py.fetchException();
     if (exc == null) return;
     // Route to loop.call_exception_handler then drop the connection.
     const handler = py.getAttr(st.loop_obj, "call_exception_handler");
@@ -592,7 +597,7 @@ fn reportProtocolError(st: *State, where: [*c]const u8) void {
 fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const t: *TransportObject = @ptrCast(self_obj.?);
     py.c.PyObject_GC_UnTrack(@ptrCast(t));
-    py.c.PyObject_ClearManagedDict(@ptrCast(t));
+    py.clear(&t.dict);
     if (t.state) |st| {
         if (!st.conn_lost) {
             if (st.reading) _ = st.engine.removeReader(st.fd);
@@ -602,14 +607,15 @@ fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         destroyState(st);
         t.state = null;
     }
-    const tp: [*c]c.PyTypeObject = c.Py_TYPE(@ptrCast(t));
+    const t_obj: py.Object = @ptrCast(t);
+    const tp: [*c]c.PyTypeObject = c.Py_TYPE(t_obj);
     const free = tp.*.tp_free.?;
-    free(@ptrCast(t));
+    free(t_obj);
 }
 
 fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) callconv(.c) c_int {
     const t: *TransportObject = @ptrCast(self_obj.?);
-    if (py.c.PyObject_VisitManagedDict(@ptrCast(t), visit, arg) != 0) return -1;
+    if (t.dict != null) if (visit.?(t.dict, arg) != 0) return -1;
     if (t.state) |st| {
         if (st.protocol != null) if (visit.?(st.protocol, arg) != 0) return -1;
         if (st.extra != null) if (visit.?(st.extra, arg) != 0) return -1;
@@ -622,7 +628,7 @@ fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) call
 
 fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
     const t: *TransportObject = @ptrCast(self_obj.?);
-    py.c.PyObject_ClearManagedDict(@ptrCast(t));
+    py.clear(&t.dict);
     if (t.state) |st| {
         // Detach from the engine before dropping the Loop reference, so a later
         // dealloc cannot touch a freed engine through st.engine.
@@ -838,22 +844,39 @@ var methods = [_]py.MethodDef{
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
 
+// A member named "__dictoffset__" makes PyType_FromSpec point tp_dictoffset at
+// our `dict` field, so generic attribute get/set materialize an instance dict on
+// every supported CPython (the managed-dict C-API is 3.13+ only).
+var members = [_]c.PyMemberDef{
+    .{ .name = "__dictoffset__", .type = c.Py_T_PYSSIZET, .offset = @offsetOf(TransportObject, "dict"), .flags = c.Py_READONLY, .doc = null },
+    .{ .name = null, .type = 0, .offset = 0, .flags = 0, .doc = null },
+};
+
+// Expose `__dict__` itself (tp_dictoffset alone makes attributes work but adds no
+// __dict__ descriptor), matching asyncio's pure-Python transports.
+var getset = [_]c.PyGetSetDef{
+    .{ .name = "__dict__", .get = c.PyObject_GenericGetDict, .set = c.PyObject_GenericSetDict, .doc = null, .closure = null },
+    .{ .name = null, .get = null, .set = null, .doc = null, .closure = null },
+};
+
 var slots = [_]py.Slot{
     .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&t_dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
+    .{ .slot = c.Py_tp_members, .pfunc = @ptrCast(&members) },
+    .{ .slot = c.Py_tp_getset, .pfunc = @ptrCast(&getset) },
     .{ .slot = c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&t_traverse)) },
     .{ .slot = c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&t_clear)) },
     .{ .slot = 0, .pfunc = null },
 };
 
-// A managed __dict__ lets callers (and tests) set instance attributes, e.g.
-// override transport.write, matching asyncio's pure-Python transports. Managed
-// dict requires GC participation (traverse/clear above).
+// The explicit __dict__ lets callers (and tests) set instance attributes, e.g.
+// override transport.write, matching asyncio's pure-Python transports. The dict
+// participates in GC via traverse/clear above.
 var spec = py.Spec{
     .name = "zloop.Transport",
     .basicsize = @sizeOf(TransportObject),
     .itemsize = 0,
-    .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_HAVE_GC | c.Py_TPFLAGS_MANAGED_DICT,
+    .flags = c.Py_TPFLAGS_DEFAULT | c.Py_TPFLAGS_HAVE_GC,
     .slots = &slots,
 };
 

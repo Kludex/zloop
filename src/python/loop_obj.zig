@@ -64,7 +64,7 @@ fn dispatchSuspend(_: *anyopaque) ?*anyopaque {
 }
 
 fn dispatchResume(_: *anyopaque, state: ?*anyopaque) void {
-    c.PyEval_RestoreThread(@ptrCast(state));
+    c.PyEval_RestoreThread(@ptrCast(@alignCast(state)));
 }
 
 fn cancelTimerHook(loop_obj: py.Object, token: usize, seq: u64) void {

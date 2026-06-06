@@ -15,23 +15,28 @@ pub const ssize = c.Py_ssize_t;
 
 // -- reference counting -------------------------------------------------------
 
+// The function forms (Py_IncRef / Py_DecRef) instead of the Py_INCREF / Py_DECREF
+// macros: the macros translate to version-specific struct layout under @cImport
+// (3.12's split ob_refcnt breaks the translation), while the functions take a
+// plain PyObject* on every supported version. Both are NULL-safe, so they cover
+// the X-variants too.
 pub inline fn incref(o: anytype) void {
-    c.Py_INCREF(@ptrCast(o));
+    c.Py_IncRef(@ptrCast(o));
 }
 pub inline fn xincref(o: anytype) void {
-    c.Py_XINCREF(@ptrCast(o));
+    c.Py_IncRef(@ptrCast(o));
 }
 pub inline fn decref(o: anytype) void {
-    c.Py_DECREF(@ptrCast(o));
+    c.Py_DecRef(@ptrCast(o));
 }
 pub inline fn xdecref(o: anytype) void {
-    c.Py_XDECREF(@ptrCast(o));
+    c.Py_DecRef(@ptrCast(o));
 }
 /// Steal a reference into a temporary and decref it (for "use then drop").
 pub inline fn clear(slot: *Object) void {
     const tmp = slot.*;
     slot.* = null;
-    if (tmp != null) c.Py_DECREF(tmp);
+    c.Py_DecRef(tmp);
 }
 
 pub inline fn newRef(o: anytype) Object {
@@ -60,6 +65,22 @@ pub inline fn isNone(o: Object) bool {
 
 /// Sentinel returned to CPython on error after PyErr is set.
 pub const err: Object = null;
+
+// Exception save/restore/display via the single-object PyErr_GetRaisedException
+// family (3.12+). Thin wrappers so the call sites read uniformly.
+pub fn fetchException() Object {
+    return c.PyErr_GetRaisedException();
+}
+
+/// Re-raise an exception previously taken with `fetchException`.
+pub fn restoreException(exc: Object) void {
+    c.PyErr_SetRaisedException(exc);
+}
+
+/// Print an unhandled exception (last-resort, when no handler is available).
+pub fn displayException(exc: Object) void {
+    c.PyErr_DisplayException(exc);
+}
 
 pub fn raise(exc: Object, msg: [*c]const u8) Object {
     c.PyErr_SetString(exc, msg);

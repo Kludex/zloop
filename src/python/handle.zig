@@ -97,7 +97,7 @@ fn runInContext(self: *HandleObject) py.Object {
     if (c.PyContext_Enter(self.context) != 0) return null;
     const result = py.callTuple(self.callback, self.args);
     // Exit even on error; preserve the callback's exception across the exit.
-    const exc = c.PyErr_GetRaisedException();
+    const exc = py.fetchException();
     if (c.PyContext_Exit(self.context) != 0) {
         // A failed exit is unexpected; surface it if the callback itself was OK.
         if (exc != null) py.decref(exc);
@@ -105,7 +105,7 @@ fn runInContext(self: *HandleObject) py.Object {
         return null;
     }
     if (exc != null) {
-        c.PyErr_SetRaisedException(exc);
+        py.restoreException(exc);
         return null; // result is null here
     }
     return result;
@@ -113,18 +113,18 @@ fn runInContext(self: *HandleObject) py.Object {
 
 fn reportException(self: *HandleObject) void {
     // Fetch the active exception and hand it to loop.call_exception_handler.
-    const exc = c.PyErr_GetRaisedException();
+    const exc = py.fetchException();
     if (exc == null) return;
     defer py.decref(exc);
 
     if (self.loop_obj == null) {
-        c.PyErr_DisplayException(exc);
+        py.displayException(exc);
         return;
     }
     const handler = py.getAttr(self.loop_obj, "call_exception_handler");
     if (handler == null) {
         c.PyErr_Clear();
-        c.PyErr_DisplayException(exc);
+        py.displayException(exc);
         return;
     }
     defer py.decref(handler);

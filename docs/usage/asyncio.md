@@ -26,11 +26,12 @@ lower-level loop APIs aren't implemented yet; the
 
     # async def main(): ...  <- the snippet goes here
 
-    asyncio.run(main(), loop_factory=zloop.new_event_loop)  # Python 3.12+
+    asyncio.run(main(), loop_factory=zloop.new_event_loop)
     ```
 
-    On Python 3.10 / 3.11, start the loop with `asyncio.Runner(loop_factory=...)`
-    instead (see [First steps](first-steps.md)); the body is unchanged.
+    `asyncio.Runner(loop_factory=...)` works too if you want to reuse one loop
+    across several `run()` calls (see [First steps](first-steps.md)); the body is
+    unchanged.
 
 ## Tasks and futures
 

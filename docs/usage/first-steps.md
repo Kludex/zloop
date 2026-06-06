@@ -18,7 +18,7 @@ is in charge of creating the loop.
 
 Let's see the three ways that come up in practice.
 
-## 1. With `asyncio.run()` (Python 3.12+)
+## 1. With `asyncio.run()`
 
 This is the modern, recommended way to run asyncio programs:
 
@@ -36,14 +36,14 @@ async def main():
 print(asyncio.run(main(), loop_factory=zloop.new_event_loop))  # (1)!
 ```
 
-1.  `loop_factory` was added to `asyncio.run()` in **Python 3.12**. On older
-    versions, use the `Runner` approach below.
+1.  `loop_factory` was added to `asyncio.run()` in Python 3.12, which is zloop's
+    minimum.
 
 !!! tip
     `loop_factory` is the cleanest hook there is. No global state, no policies,
     no side effects - just "build the loop with *this*".
 
-## 2. With `asyncio.Runner` (Python 3.11+)
+## 2. With `asyncio.Runner`
 
 `Runner` is the object `asyncio.run()` uses under the hood. You can use it
 directly, which is handy when you want to run several coroutines on the same
