@@ -13,7 +13,9 @@ jobs:
     name: Run zizmor
     runs-on: ubuntu-latest
     permissions:
-      security-events: write
+      contents: read # clone the private repo
+      security-events: write # upload the SARIF results
+      actions: read # codeql-action/upload-sarif reads the workflow run (required on private repos)
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

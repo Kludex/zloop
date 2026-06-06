@@ -155,6 +155,12 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     py.decref(r);
     st.started = true;
 
+    // connection_made may close the transport synchronously (a common pattern,
+    // and what some asyncio tests do). The fd is then already closed, so starting
+    // to read would register a dead fd - epoll rejects it with EBADF, kqueue
+    // silently tolerates it. Skip reading and tracking when that happened.
+    if (st.closing or st.conn_lost) return obj;
+
     startReading(st) catch {
         py.decref(obj);
         return py.raiseRuntime("zloop: could not start reading");

@@ -114,6 +114,13 @@ fn new(tp: [*c]c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py
 
 fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    // zloop.Loop is subclassed by zloop._io.Loop, whose instances carry a
+    // __weakref__ (asyncio code, and the loop factory, weakref the loop). A
+    // base-type dealloc must invalidate those weakrefs before tp_free, or a live
+    // weakref is left pointing at freed memory - a use-after-free that surfaces
+    // as a crash in the GC / isinstance machinery the next time it is read.
+    const tp: [*c]c.PyTypeObject = c.Py_TYPE(@ptrCast(self));
+    if (tp.*.tp_weaklistoffset != 0) c.PyObject_ClearWeakRefs(@ptrCast(self));
     if (self.engine) |eng| {
         eng.deinit();
         gpa.destroy(eng);
