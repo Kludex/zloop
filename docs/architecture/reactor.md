@@ -89,6 +89,9 @@ spinning, no oversleeping.
       rounded *up* to 1ms - exactly what asyncio does - to avoid degrading into a
       zero-timeout busy-poll.
 
+    [Platform backends](backends.md) covers all of this in depth - including how
+    `io_uring` differs and where it might fit in the future.
+
 ## Tested in isolation
 
 Because the reactor has no Python in it, it's tested as plain Zig - with real

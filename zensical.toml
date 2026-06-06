@@ -25,6 +25,7 @@ nav = [
   { "Architecture" = [
     "architecture/overview.md",
     "architecture/reactor.md",
+    "architecture/backends.md",
     "architecture/the-loop.md",
     "architecture/transports.md",
     "architecture/reuse.md",
