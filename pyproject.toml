@@ -28,6 +28,7 @@ dev = [
 ]
 docs = [
     "zensical",
+    "matplotlib",  # docs/gen_bench_chart.py renders the benchmark chart
 ]
 
 [tool.hatch.build.targets.wheel]
