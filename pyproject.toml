@@ -31,6 +31,9 @@ docs = [
     "zensical",
     "matplotlib",  # docs/gen_bench_chart.py renders the benchmark chart
 ]
+bench = [
+    "uvloop",  # the comparison baseline for bench_uvloop/bench_ci.py
+]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"

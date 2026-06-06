@@ -14,7 +14,16 @@ python echoclient.py --msize 1000 --num 100000 --workers 3 --addr 127.0.0.1:2500
 
 # the whole matrix (loops x {proto,buffered,streams} x {1,10,100 KiB}), best of 3
 NUM=50000 WORKERS=3 BEST_OF=3 bash run_matrix.sh
+
+# CI-friendly runner: portable paths, smaller matrix, Markdown-table output
+scripts/bench                                  # asyncio vs uvloop vs zloop
+scripts/bench --modes proto --sizes 1000       # narrow it down
 ```
+
+`bench_ci.py` is what the **Benchmark** GitHub Actions workflow runs on Ubuntu
+(real Linux), writing the table to the run's job summary. uvloop comes from the
+`bench` dependency group. Linux is the platform that matters here - uvloop's lead
+over asyncio is a Linux number, so the CI table is the meaningful comparison.
 
 `run_matrix.sh` runs every cell **sequentially** — echo throughput is
 contention-sensitive, so running cells concurrently would skew the numbers.

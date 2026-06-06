@@ -31,6 +31,30 @@ uvicorn app:app --loop zloop:new_event_loop
   1 KiB echo +16% on CPython 3.14 / macOS arm64). `create_future` ties, because
   all three loops reuse CPython's C-accelerated `_asyncio.Future`.
 
+## Benchmarks
+
+The fairest comparison is uvloop's *own* echo benchmark, run unchanged except
+for a `--zloop` server flag mirroring `--uvloop` (the client is byte-for-byte
+uvloop's). Requests/sec, higher is better - macOS arm64, CPython 3.14, 3
+workers, best of 3:
+
+| Message | Server mode | asyncio | uvloop | zloop | zloop vs uvloop |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 KiB | proto | 113k | 113k | **121k** | **+7%** |
+| 1 KiB | buffered | 115k | 115k | **123k** | **+7%** |
+| 1 KiB | streams | 83k | 90k | **103k** | **+14%** |
+| 10 KiB | proto | 105k | 110k | **113k** | **+3%** |
+| 10 KiB | buffered | 105k | 105k | **124k** | **+18%** |
+| 10 KiB | streams | 81k | 86k | **95k** | **+11%** |
+
+For the 1-10 KiB messages common in HTTP, WebSocket frames, and RPC, zloop leads
+uvloop in every cell. The 100 KiB row is omitted: at that size the test measures
+loopback bandwidth, not the loop, and all three swing wildly run-to-run.
+
+Reproduce it with `scripts/bench` (or `bash bench_uvloop/run_matrix.sh` for the
+full matrix); the **Benchmark** CI workflow runs it on Linux and posts the table
+to the run summary.
+
 ## How it works
 
 The loop *engine* lives in Zig; CPython is reused only where reimplementing
