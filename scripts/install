@@ -1,13 +1,12 @@
 #!/bin/sh -e
 
-# Create the virtual environment and install the dev + docs dependency groups,
-# then compile the Zig extension against that interpreter.
+# Create the virtual environment and install the dev + docs dependency groups.
+# `uv sync` builds the Zig extension through the hatchling build hook
+# (hatch_build.py), so no separate compile step is needed - it just needs `zig`
+# on PATH.
 
 if [ -z "$GITHUB_ACTIONS" ]; then
     set -x
 fi
 
 uv sync --frozen --all-groups
-
-# Build the Zig extension against the venv's interpreter so `import zloop` works.
-./build_ext.sh "$(pwd)/.venv/bin/python"

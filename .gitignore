@@ -2,6 +2,8 @@
 zig-out/
 build_err.txt
 *.so
+dist/
+build/
 __pycache__/
 .pytest_cache/
 .coverage
