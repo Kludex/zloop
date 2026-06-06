@@ -1,20 +1,16 @@
 # zloop
 
-An [asyncio](https://docs.python.org/3/library/asyncio.html)-compatible event
-loop whose engine is written in [Zig](https://ziglang.org). It is to asyncio
-what [uvloop](https://github.com/MagicStack/uvloop) is - a drop-in
-`asyncio.AbstractEventLoop` implementation - except the engine is a hand-written
-kqueue/epoll reactor in Zig rather than libuv wrapped in Cython.
+A drop-in [asyncio](https://docs.python.org/3/library/asyncio.html) event loop
+whose engine is written in [Zig](https://ziglang.org). It's to asyncio what
+[uvloop](https://github.com/MagicStack/uvloop) is - a real
+`asyncio.AbstractEventLoop` - except the engine is a hand-written kqueue/epoll
+reactor in Zig rather than libuv wrapped in Cython.
 
 ```python
 import asyncio
 import zloop
 
-async def main():
-    await asyncio.sleep(0.1)
-    return "hello from a Zig event loop"
-
-print(asyncio.run(main(), loop_factory=zloop.new_event_loop))
+print(asyncio.run(asyncio.sleep(0, "hello from a Zig loop"), loop_factory=zloop.new_event_loop))
 ```
 
 With [uvicorn](https://www.uvicorn.org):
@@ -23,101 +19,47 @@ With [uvicorn](https://www.uvicorn.org):
 uvicorn app:app --loop zloop:new_event_loop
 ```
 
-## Status
+## Why
 
-- Runs [uvicorn](https://github.com/encode/uvicorn)'s **entire test suite**
-  (1048 passed, 14 platform-skips) - identical to running on stock asyncio.
-- The Python edge has **100% test coverage** via high-level behavioural tests
-  that exercise the Zig core end to end (real sockets, TLS, signals, threads,
-  timers).
-- HTTP/1.1, WebSockets, TLS, Unix sockets, flow control, signals, executors.
-
-## Performance
-
-Faster than uvloop on the workloads measured so far (`bench.py`, CPython 3.14,
-macOS arm64, best of several runs; figures vary run-to-run by ~10%):
-
-| workload          | asyncio | uvloop | zloop  | vs uvloop |
-|-------------------|---------|--------|--------|-----------|
-| `call_soon`       | 2.4 M/s | 4.2 M/s| 6.1 M/s| **+46%**  |
-| `call_later`      | 0.6 M/s | 3.6 M/s| 4.0 M/s| **+12%**  |
-| echo (1 KiB RTT)  | ~21 k/s | 50 k/s | 58 k/s | **+16%**  |
-| `create_future`   | 0.04 M/s| 0.04 M/s| 0.04 M/s| tie      |
-
-`create_future` ties because all three reuse CPython's C-accelerated
-`_asyncio.Future`. The wins come from doing the per-callback work in Zig and
-the contextvars handling through the raw C-API (`PyContext_Enter/Exit`,
-`PyContext_CopyCurrent`) instead of Python-level `context.run()` /
-`copy_context()`, plus caching the hot asyncio callables. Run `python bench.py`
-(and `bench_uvloop/run_matrix.sh`) yourself; see the docs for full numbers and
-caveats.
+- **Drop-in.** A genuine `AbstractEventLoop`, so the asyncio ecosystem -
+  uvicorn, FastAPI, AnyIO, HTTPX - runs on it unchanged.
+- **Correct.** Passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
+  test suite (1048 tests), identical to stock asyncio, plus its own suite at
+  **100%** coverage.
+- **Fast.** Faster than uvloop on the workloads measured so far - scheduling,
+  timers, and small/medium-message socket throughput (e.g. `call_soon` +46%,
+  1 KiB echo +16% on CPython 3.14 / macOS arm64). `create_future` ties, because
+  all three loops reuse CPython's C-accelerated `_asyncio.Future`.
 
 ## How it works
 
-The event loop *engine* lives in Zig; CPython is reused only for the two things
-it already does correctly and that would be reckless to reimplement: driving
-coroutines (`asyncio.Future` / `asyncio.Task`) and the TLS state machine
-(`asyncio.sslproto`). This is exactly uvloop's boundary.
+The loop *engine* lives in Zig; CPython is reused only where reimplementing
+would be reckless: driving coroutines (`asyncio.Future` / `asyncio.Task`) and
+the TLS state machine (`asyncio.sslproto`). That's exactly uvloop's boundary.
 
 ```
-  zloop/__init__.py         new_event_loop() factory          Python edge
-  zloop/_io.py              connection-setup choreography
-  --------------------------------------------------------------------------
-  src/python/*.zig          CPython C-API adapter             adapter
-    Loop (AbstractEventLoop), Handle, Transport
-    reuses asyncio.Future/Task + asyncio.sslproto
-  --------------------------------------------------------------------------
-  src/core/loop.zig         the event loop (run-once engine)  domain
-  src/python/transport_obj  buffered socket I/O + flow control
-  --------------------------------------------------------------------------
-  src/core/reactor.zig      kqueue / epoll demultiplexer      platform
-  src/core/timers.zig       monotonic timer min-heap
-  src/core/sys.zig          libc syscall wrappers
+zloop/            Python edge - new_event_loop() factory, connection setup
+src/python/*.zig  CPython C-API adapter - Loop, Handle, Transport
+src/core/*.zig    pure-Zig domain - run-once engine, kqueue/epoll reactor, timer heap
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design.
-
-## Building
+## Develop
 
 ```bash
-./build_ext.sh                 # build against ./.venv (or pass a python path)
-ZLOOP_BUILD_MODE=Debug ./build_ext.sh   # debug build with safety checks
-zig build test                 # run the pure-Zig core unit tests
+scripts/install   # venv + deps, then build the Zig extension
+scripts/check     # ruff, mypy, zig fmt
+scripts/test      # pytest under coverage
+scripts/coverage  # 100% gate
 ```
 
-The build produces `zloop/_zloop<EXT_SUFFIX>.so`, importable as `zloop`.
+CI runs these on macOS (kqueue) and Linux (epoll) across CPython 3.10-3.14.
 
-## Testing & checks
+## Docs
 
-```bash
-# zloop's own suite + 100% coverage gate
-python -m coverage run --source=zloop -m pytest tests/
-python -m coverage report --fail-under=100
-
-zig build test                          # pure-Zig core unit tests
-ruff check zloop/ tests/                # lint (Python)
-ruff format --check zloop/ tests/       # format (Python)
-zig fmt --check src/ build.zig          # format (Zig)
-mypy zloop/                             # strict type check
-```
-
-CI (`.github/workflows/ci.yml`) runs all of the above on macOS (kqueue) and
-Linux (epoll) across CPython 3.10-3.14.
-
-## Documentation
-
-The docs live in `docs/` and are built with [Zensical](https://zensical.org):
-
-```bash
-uv pip install zensical
-zensical serve          # live preview at http://127.0.0.1:8000
-zensical build          # render the static site into site/
-```
-
-They start with how to use zloop alongside the asyncio ecosystem (asyncio,
-uvicorn, AnyIO, HTTP clients, FastAPI), then cover the architecture in depth
-with diagrams.
+Full usage and architecture docs (with diagrams) build with
+[Zensical](https://zensical.org): `scripts/build`, or `zensical serve` for a
+live preview. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design in one file.
 
 ## Platforms
 
-macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.10+.
+macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.10+. MIT licensed.
