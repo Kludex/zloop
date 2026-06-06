@@ -9,5 +9,6 @@ __pycache__/
 htmlcov/
 .venv/
 .uvicorn-upstream/
+.uvloop-upstream/
 site/
 CODEX_REVIEW.md
