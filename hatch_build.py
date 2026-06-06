@@ -12,6 +12,20 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 ROOT = Path(__file__).parent
 
+# cibuildwheel builds every macOS wheel on the arm64 runner and asks for a
+# specific arch through ARCHFLAGS; translate it into a Zig cross-compile target
+# so the produced `.so` matches the wheel tag delocate enforces.
+_MACOS_ZIG_TARGET = {"arm64": "aarch64-macos", "x86_64": "x86_64-macos"}
+
+
+def _zig_target_args() -> list[str]:
+    archflags = os.environ.get("ARCHFLAGS", "")
+    arches = archflags.split()[1::2]  # "-arch x86_64 -arch arm64" -> ["x86_64", "arm64"]
+    if len(arches) != 1 or sys.platform != "darwin":
+        return []
+    target = _MACOS_ZIG_TARGET.get(arches[0])
+    return [f"-Dtarget={target}"] if target else []
+
 
 def _zig_command() -> list[str]:
     """Resolve how to invoke Zig: a `zig` on PATH, else the `ziglang` pip package.
@@ -52,7 +66,7 @@ class ZigBuildHook(BuildHookInterface):
         mode = os.environ.get("ZLOOP_BUILD_MODE", "ReleaseFast")
         env = {**os.environ, "ZLOOP_PYTHON_INCLUDE": include, "ZLOOP_EXT_SUFFIX": ext_suffix}
         subprocess.run(
-            [*_zig_command(), "build", f"-Doptimize={mode}"],
+            [*_zig_command(), "build", f"-Doptimize={mode}", *_zig_target_args()],
             cwd=ROOT,
             env=env,
             check=True,
