@@ -1,10 +1,9 @@
 [build-system]
-requires = ["hatchling", "ziglang==0.16.0"]
+requires = ["hatchling", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "zloop"
-version = "0.1.0"
 description = "An asyncio event loop with a Zig core."
 readme = "README.md"
 license = "MIT"
@@ -16,6 +15,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Zig",
 ]
+dynamic = ["version"]
 
 [dependency-groups]
 dev = [
@@ -30,6 +30,16 @@ docs = [
     "zensical",
     "matplotlib",  # docs/gen_bench_chart.py renders the benchmark chart
 ]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+vcs = "git"
+style = "pep440"
+bump = true
+metadata = false  # drop the +<hash> local segment; PyPI rejects it on uploads
+fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["zloop"]
