@@ -229,6 +229,7 @@ fn scheduleTimerNs(self: *LoopObject, when_s: f64, when_ns: u64, callback: py.Ob
 
 fn call_at(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null; // check closed before arg validation, like asyncio
     if (py.tupleSize(args) < 2) return py.raiseType("call_at(when, callback, ...)");
     const when = py.asF64(py.tupleGet(args, 0)) orelse return null;
     const callback = py.tupleGet(args, 1);
@@ -243,6 +244,7 @@ fn call_at(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) cal
 
 fn call_later(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject) callconv(.c) py.Object {
     const self: *LoopObject = @ptrCast(self_obj.?);
+    if (raiseIfClosed(self)) return null; // check closed before arg validation, like asyncio
     if (py.tupleSize(args) < 2) return py.raiseType("call_later(delay, callback, ...)");
     const delay = py.asF64(py.tupleGet(args, 0)) orelse return null;
     const callback = py.tupleGet(args, 1);
