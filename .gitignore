@@ -9,3 +9,5 @@ __pycache__/
 htmlcov/
 .venv/
 .uvicorn-upstream/
+site/
+CODEX_REVIEW.md

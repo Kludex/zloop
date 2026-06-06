@@ -1,0 +1,115 @@
+---
+icon: lucide/zap
+---
+
+# zloop
+
+<p align="center">
+    <em>An asyncio event loop with a Zig core — a drop-in, faster-than-uvloop alternative.</em>
+</p>
+
+---
+
+**Documentation**: you are reading it 🙂
+
+**Source Code**: <a href="https://github.com/Kludex/zloop" target="_blank">https://github.com/Kludex/zloop</a>
+
+---
+
+zloop is an [asyncio](https://docs.python.org/3/library/asyncio.html) event loop whose
+engine is written in [Zig](https://ziglang.org). It is to asyncio what
+[uvloop](https://github.com/MagicStack/uvloop) is: a **drop-in replacement** for the
+default event loop that you can use without changing your application code.
+
+The difference is what's underneath. uvloop wraps libuv from Cython; zloop is a
+hand-written kqueue/epoll reactor in Zig, bound to CPython through a thin adapter.
+
+The key features are:
+
+* **Drop-in**: it's a normal `asyncio.AbstractEventLoop`. If your code runs on
+  asyncio, it runs on zloop.
+* **Fast**: faster than uvloop on every workload we measure — scheduling,
+  timers, and socket throughput. See [Performance](reference/performance.md).
+* **Familiar**: works the same way uvloop does, so the tools you already know
+  ([uvicorn](usage/uvicorn.md), [AnyIO](usage/anyio.md),
+  [FastAPI](usage/fastapi.md)) just pick it up.
+* **Tested**: it passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
+  test suite, plus its own suite at 100% coverage.
+
+## Installation
+
+<!-- termynal -->
+
+```console
+$ pip install zloop
+---> 100%
+```
+
+!!! note "Requirements"
+    zloop needs **CPython 3.10+** and runs on **macOS / BSD** (kqueue) and
+    **Linux** (epoll).
+
+## Example
+
+Let's create the simplest possible thing: run a coroutine on zloop.
+
+```python title="main.py" hl_lines="9"
+import asyncio
+
+import zloop
+
+
+async def main():
+    print("Hello from a Zig event loop 👋")
+
+
+asyncio.run(main(), loop_factory=zloop.new_event_loop)  # (1)!
+```
+
+1.  This is the one line that matters. `loop_factory` tells `asyncio.run()`
+    *which* loop to build — and `zloop.new_event_loop` builds a zloop one.
+
+    Everything else is plain asyncio. That's the whole point.
+
+Run it:
+
+<!-- termynal -->
+
+```console
+$ python main.py
+
+Hello from a Zig event loop 👋
+```
+
+That's it. The coroutine ran, but the loop driving it — the timers, the
+callback scheduling, the I/O polling — was all Zig. 🎉
+
+## Where to go next
+
+<div class="grid cards" markdown>
+
+-   :material-rocket-launch: **[First steps](usage/first-steps.md)**
+
+    ---
+
+    The 30-second tour: how to actually plug zloop into your program.
+
+-   :material-server-network: **[With uvicorn](usage/uvicorn.md)**
+
+    ---
+
+    The most common reason to use zloop. One CLI flag.
+
+-   :material-sitemap: **[Architecture](architecture/overview.md)**
+
+    ---
+
+    How a Zig reactor becomes a Python event loop, with diagrams.
+
+-   :material-speedometer: **[Performance](reference/performance.md)**
+
+    ---
+
+    The benchmarks, the methodology, and the honest caveats.
+
+</div>

@@ -103,6 +103,20 @@ mypy zloop/                             # strict type check
 CI (`.github/workflows/ci.yml`) runs all of the above on macOS (kqueue) and
 Linux (epoll) across CPython 3.10-3.14.
 
+## Documentation
+
+The docs live in `docs/` and are built with [Zensical](https://zensical.org):
+
+```bash
+uv pip install zensical
+zensical serve          # live preview at http://127.0.0.1:8000
+zensical build          # render the static site into site/
+```
+
+They start with how to use zloop alongside the asyncio ecosystem (asyncio,
+uvicorn, AnyIO, HTTP clients, FastAPI), then cover the architecture in depth
+with diagrams.
+
 ## Platforms
 
 macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.10+.
