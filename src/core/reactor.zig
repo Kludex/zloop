@@ -169,7 +169,9 @@ const EpollReactor = struct {
     allocator: std.mem.Allocator,
 
     const TokenInterest = struct { token: usize, interest: Interest };
-    const EPOLL = c.EPOLL;
+    // std.c exposes the epoll_* libc functions and epoll_event, but not the EPOLL
+    // constants struct; take those from std.os.linux (the functions stay libc).
+    const EPOLL = std.os.linux.EPOLL;
 
     pub fn init(allocator: std.mem.Allocator) !EpollReactor {
         const epfd = c.epoll_create1(EPOLL.CLOEXEC);
