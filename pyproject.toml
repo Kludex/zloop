@@ -63,8 +63,10 @@ test-command = 'python -c "import asyncio, zloop; assert asyncio.run(asyncio.sle
 
 [tool.cibuildwheel.linux]
 # manylinux container has no Zig; the ziglang wheel in the isolated build env
-# provides it. Nothing extra to install.
-archs = ["x86_64", "aarch64"]
+# provides it. Nothing extra to install. Each runner builds its native arch
+# (x86_64 on ubuntu-latest, aarch64 on ubuntu-24.04-arm) - running the foreign
+# manylinux container without QEMU hangs on `exec format error`.
+archs = ["auto"]
 
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
