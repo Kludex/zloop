@@ -33,11 +33,16 @@ Results (macOS arm64, CPython 3.14, 3 workers, best of 3), requests/sec:
 
 ```mermaid
 xychart-beta
-    title "Echo throughput, zloop / uvloop (higher favors zloop)"
+    title "Echo throughput, requests/sec in thousands (higher is better)"
     x-axis ["proto 1K", "buf 1K", "streams 1K", "proto 10K", "buf 10K", "streams 10K"]
-    y-axis "ratio" 0 --> 1.3
-    bar [1.07, 1.07, 1.14, 1.03, 1.18, 1.11]
+    y-axis "k req/s" 0 --> 130
+    line "uvloop" [113, 115, 90, 110, 105, 86]
+    line "zloop" [121, 123, 103, 113, 124, 95]
 ```
+
+Both loops are plotted: the upper line is zloop, the lower line uvloop. zloop
+leads in every configuration, with the widest margins on `streams` and
+`buffered`.
 
 For the message sizes real servers live in - HTTP requests, WebSocket frames,
 RPC calls are almost always 1 to 10 KiB - **zloop beats uvloop on every cell**,
