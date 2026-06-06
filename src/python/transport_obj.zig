@@ -307,44 +307,57 @@ fn deliverBuffered(st: *State) void {
 const READ_CHUNK = 256 * 1024;
 
 fn deliverData(st: *State) void {
-    var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
-    if (data == null) {
-        py.c.PyErr_Clear();
-        return;
-    }
-    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
-    const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
-        error.WouldBlock, error.Interrupted => {
-            py.decref(data);
-            return;
-        },
-        else => {
-            py.decref(data);
-            fatalError(st, err);
-            return;
-        },
-    };
-
-    if (n == 0) {
-        py.decref(data);
-        handleEof(st);
-        return;
-    }
-
-    // Shrink the bytes object to what we actually read.
-    if (n != READ_CHUNK) {
-        if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+    // Drain the socket per readiness notification. Level-triggered epoll re-fires
+    // while data/EOF remain, but io_uring's multishot poll is edge-triggered: a
+    // recv that doesn't reach EAGAIN/EOF may get no further notification (e.g.
+    // "data" then FIN arriving together). Reading until WouldBlock or EOF makes
+    // the read path correct on both backends. A short read (< READ_CHUNK) means
+    // the socket buffer is drained, so stop without a speculative extra recv.
+    while (true) {
+        if (st.conn_lost or !st.reading) return;
+        var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
+        if (data == null) {
             py.c.PyErr_Clear();
-            return; // _PyBytes_Resize already released `data` on failure
+            return;
         }
-    }
-    defer py.decref(data);
+        const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
+        const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted => {
+                py.decref(data);
+                return;
+            },
+            else => {
+                py.decref(data);
+                fatalError(st, err);
+                return;
+            },
+        };
 
-    const r = protoCall1(st, "data_received", data);
-    if (r == null) {
-        reportProtocolError(st, "data_received");
-    } else {
+        if (n == 0) {
+            py.decref(data);
+            handleEof(st);
+            return;
+        }
+
+        // Shrink the bytes object to what we actually read.
+        if (n != READ_CHUNK) {
+            if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+                py.c.PyErr_Clear();
+                return; // _PyBytes_Resize already released `data` on failure
+            }
+        }
+
+        const r = protoCall1(st, "data_received", data);
+        py.decref(data);
+        if (r == null) {
+            reportProtocolError(st, "data_received");
+            return;
+        }
         py.decref(r);
+        // Loop until WouldBlock/EOF: under edge-triggered io_uring a pending FIN
+        // after a short read gets no further notification, so we must reach it
+        // here (the next recv returns 0). The extra EAGAIN recv is the cost of
+        // being backend-agnostic.
     }
 }
 
