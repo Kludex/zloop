@@ -44,6 +44,7 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source_pkgs = ["zloop"]
 branch = true
+parallel = true
 omit = ["zloop/_zloop*"]
 
 [tool.coverage.report]
