@@ -131,15 +131,22 @@ pub const Loop = struct {
         };
     }
 
-    pub fn deinit(self: *Loop) void {
-        // Release every token still owned by the engine so its embedder (the
-        // Python adapter) can drop the Handle refs it holds. Without this,
-        // callbacks scheduled but never run when the loop closes would leak.
+    /// Release every deferred-callback token the engine still owns (ready queue,
+    /// timer heap, cross-thread inbox) via the embedder's drop hook. Called from
+    /// both close() and deinit(): dropping these on close breaks the
+    /// engine->Handle->loop reference cycle so the loop can be collected even
+    /// when it is closed while callbacks/timers are still pending.
+    fn dropPending(self: *Loop) void {
         self.drainXthread(); // moves cross-thread tokens into `ready`
         while (self.ready.pop()) |token| self.dispatcher.drop(self.dispatcher.ctx, token);
         for (self.timers.heap.items) |timer| {
             if (!timer.cancelled) self.dispatcher.drop(self.dispatcher.ctx, timer.token);
         }
+        self.timers.heap.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *Loop) void {
+        self.dropPending();
         var it = self.fds.valueIterator();
         while (it.next()) |st| {
             if (st.reader) |cb| cb.dispose_();
@@ -206,19 +213,40 @@ pub const Loop = struct {
     // -- I/O readiness --------------------------------------------------------
 
     pub fn addReader(self: *Loop, fd: sys.fd_t, cb: IoCallback) !void {
-        const gop = try self.fds.getOrPut(fd);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        if (gop.value_ptr.reader) |old| old.dispose_();
-        gop.value_ptr.reader = cb;
-        try self.syncFdReg(fd, gop.value_ptr.*, !gop.found_existing);
+        try self.addIo(fd, cb, .read);
     }
 
     pub fn addWriter(self: *Loop, fd: sys.fd_t, cb: IoCallback) !void {
+        try self.addIo(fd, cb, .write);
+    }
+
+    const Dir = enum { read, write };
+
+    /// Register an I/O callback transactionally: sync the reactor against the
+    /// would-be new interest FIRST, and only commit to `self.fds` (and dispose
+    /// any replaced callback) once that succeeds. On failure nothing is mutated
+    /// and `cb` is still owned by the caller - so the caller's error handling
+    /// (which releases `cb`) never races a stale entry in `fds`.
+    fn addIo(self: *Loop, fd: sys.fd_t, cb: IoCallback, dir: Dir) !void {
         const gop = try self.fds.getOrPut(fd);
         if (!gop.found_existing) gop.value_ptr.* = .{};
-        if (gop.value_ptr.writer) |old| old.dispose_();
-        gop.value_ptr.writer = cb;
-        try self.syncFdReg(fd, gop.value_ptr.*, !gop.found_existing);
+        var next = gop.value_ptr.*;
+        switch (dir) {
+            .read => next.reader = cb,
+            .write => next.writer = cb,
+        }
+        self.syncFdReg(fd, next, !gop.found_existing) catch |err| {
+            if (!gop.found_existing) _ = self.fds.remove(fd);
+            return err;
+        };
+        // Reactor committed; now it is safe to dispose the replaced callback and
+        // publish the new state.
+        const old = switch (dir) {
+            .read => gop.value_ptr.reader,
+            .write => gop.value_ptr.writer,
+        };
+        if (old) |o| o.dispose_();
+        gop.value_ptr.* = next;
     }
 
     pub fn removeReader(self: *Loop, fd: sys.fd_t) bool {
@@ -354,7 +382,11 @@ pub const Loop = struct {
     }
 
     pub fn close(self: *Loop) void {
+        if (self.closed) return;
         self.closed = true;
+        // Drop pending callbacks/timers now (asyncio clears _ready/_scheduled on
+        // close) so a closed loop with queued work can still be collected.
+        self.dropPending();
     }
 };
 

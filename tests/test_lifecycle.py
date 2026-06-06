@@ -60,6 +60,34 @@ def test_close_idempotent(loop: asyncio.AbstractEventLoop) -> None:
     assert loop.is_closed() is True
 
 
+def test_close_with_pending_callbacks_is_collectable() -> None:
+    import gc
+    import weakref
+
+    def make() -> weakref.ref:
+        lp = zloop.new_event_loop()
+        lp.call_soon(lambda: None)
+        lp.call_later(3600, lambda: None)
+        lp.close()  # drops pending handles, breaking the engine<->handle<->loop cycle
+        return weakref.ref(lp)
+
+    ref = make()
+    gc.collect()
+    assert ref() is None  # loop was collected, no leak
+
+
+def test_cancel_timer_after_loop_closed_and_freed() -> None:
+    import gc
+
+    lp = zloop.new_event_loop()
+    handle = lp.call_later(3600, lambda: None)
+    lp.close()
+    del lp
+    gc.collect()
+    handle.cancel()  # must not crash (handle owns the loop)
+    assert handle.cancelled() is True
+
+
 def test_cannot_close_running_loop(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> None:
         with pytest.raises(RuntimeError):

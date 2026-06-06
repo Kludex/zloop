@@ -57,6 +57,7 @@ pub fn create(
     h.when = 0;
     h.timer_seq = 0;
     h.loop_obj = py.newRef(loop_obj); // owned - keeps the loop alive for cancel()
+    // tp_alloc already GC-tracks the instance on this CPython; do not track again.
     return obj;
 }
 
@@ -76,9 +77,9 @@ fn makeContext() py.Object {
 /// Execute the handle: call context.run(callback, *args), routing any exception
 /// to the loop's exception handler. Safe to call on a cancelled handle (no-op).
 pub fn run(self: *HandleObject) void {
-    if (self.cancelled != 0) return;
+    if (self.cancelled != 0 or self.callback == null) return;
 
-    const result = if (!py.isNone(self.context))
+    const result = if (self.context != null and !py.isNone(self.context))
         runInContext(self)
     else
         py.callTuple(self.callback, self.args);
@@ -211,6 +212,12 @@ var timer_slots = [_]py.Slot{
     .{ .slot = 0, .pfunc = null },
 };
 
+// Handles are deliberately NOT GC types: they are the hottest allocation in the
+// loop and GC tracking measurably slows call_soon/call_later below uvloop. The
+// engine->Handle->loop reference cycle is instead broken by Loop.close()'s
+// dropPending() (asyncio likewise clears _ready/_scheduled on close). The only
+// residual leak is abandoning a loop WITHOUT closing it while callbacks/timers
+// are still pending - a misuse; always close (or use asyncio.run, which does).
 var handle_spec = py.Spec{
     .name = "zloop.Handle",
     .basicsize = @sizeOf(HandleObject),

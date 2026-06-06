@@ -512,7 +512,16 @@ fn scheduleConnectionLost(st: *State, exc: py.Object) void {
     defer py.decref(method);
     const arg: py.Object = if (exc != null) exc else py.c.Py_None();
     const r = py.c.PyObject_CallFunctionObjArgs(call_soon, method, arg, @as(py.Object, null));
-    if (r == null) py.c.PyErr_Clear() else py.decref(r);
+    if (r == null) {
+        // Scheduling failed (e.g. the loop is already closed). Deliver
+        // connection_lost synchronously instead, so the loop still untracks the
+        // transport rather than leaking it in loop._transports.
+        py.c.PyErr_Clear();
+        const dr = t_deliver_connection_lost(st.self_obj, arg);
+        if (dr == null) py.c.PyErr_Clear() else py.decref(dr);
+    } else {
+        py.decref(r);
+    }
 }
 
 fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv(.c) py.Object {
