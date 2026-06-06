@@ -93,6 +93,7 @@ pub const Loop = struct {
     running: bool = false,
     stopping: bool = false,
     closed: bool = false,
+    dropped: bool = false,
 
     /// Cross-thread inbox: call_soon_threadsafe appends here under `xlock` and
     /// wakes the loop; runOnce drains it into `ready` on the loop thread. The
@@ -137,6 +138,13 @@ pub const Loop = struct {
     /// engine->Handle->loop reference cycle so the loop can be collected even
     /// when it is closed while callbacks/timers are still pending.
     fn dropPending(self: *Loop) void {
+        // Run exactly once. close() drops pending work to break the cycle; deinit()
+        // also calls this for loops that were never closed. Without this guard a
+        // closed-then-freed loop drops twice - and a token that is both a cancelled
+        // timer and still referenced elsewhere gets double-decref'd into a
+        // use-after-free (a crash only ReleaseFast exposes; Debug zeroing hides it).
+        if (self.dropped) return;
+        self.dropped = true;
         self.drainXthread(); // moves cross-thread tokens into `ready`
         while (self.ready.pop()) |token| self.dispatcher.drop(self.dispatcher.ctx, token);
         for (self.timers.heap.items) |timer| {

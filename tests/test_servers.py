@@ -105,8 +105,9 @@ def test_create_server_not_serving_until_started(loop: asyncio.AbstractEventLoop
 def test_create_server_bind_error(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> None:
         with pytest.raises(OSError):
-            # port 1 is privileged; binding should fail
-            await loop.create_server(asyncio.Protocol, "127.0.0.1", 1)
+            # An address not assigned to any local interface can never be bound,
+            # regardless of privilege (privileged ports succeed when run as root).
+            await loop.create_server(asyncio.Protocol, "192.0.2.1", 0)
 
     run(loop, main())
 
