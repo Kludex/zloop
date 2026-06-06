@@ -15,21 +15,15 @@ nav = [
     "usage/install.md",
     "usage/first-steps.md",
   ] },
-  { "Using zloop with…" = [
+  { "Using zloop" = [
     "usage/asyncio.md",
-    "usage/uvicorn.md",
-    "usage/anyio.md",
-    "usage/clients.md",
-    "usage/fastapi.md",
+    "usage/servers.md",
   ] },
   { "Architecture" = [
     "architecture/overview.md",
-    "architecture/reactor.md",
-    "architecture/backends.md",
     "architecture/the-loop.md",
     "architecture/transports.md",
     "architecture/reuse.md",
-    "architecture/lifecycle.md",
   ] },
   { "Reference" = [
     "reference/compatibility.md",

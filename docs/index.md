@@ -34,8 +34,8 @@ The key features are:
   timers, and small/medium-message socket throughput. See
   [Performance](reference/performance.md).
 * **Familiar**: works the same way uvloop does, so the tools you already know
-  ([uvicorn](usage/uvicorn.md), [AnyIO](usage/anyio.md),
-  [FastAPI](usage/fastapi.md)) just pick it up.
+  ([uvicorn](usage/servers.md), [AnyIO](usage/asyncio.md#with-anyio),
+  [FastAPI](usage/servers.md#fastapi-starlette)) just pick it up.
 * **Tested**: it passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
   test suite, plus its own suite at 100% coverage.
 
@@ -97,7 +97,7 @@ callback scheduling, the I/O polling - was all Zig. 🎉
 
     The 30-second tour: how to actually plug zloop into your program.
 
--   :material-server-network: **[With uvicorn](usage/uvicorn.md)**
+-   :material-server-network: **[With uvicorn & FastAPI](usage/servers.md)**
 
     ---
 

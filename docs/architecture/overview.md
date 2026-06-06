@@ -67,10 +67,10 @@ graph TD
 
 Reading it bottom-up:
 
-* **[`reactor.zig`](reactor.md)** - the kqueue/epoll demultiplexer. Knows nothing
-  about Python or callbacks; it maps file descriptors to readiness.
-* **[`loop.zig`](the-loop.md)** - the actual event loop: timer heap, ready queue,
-  and the `run_once` cycle that drives everything.
+* **[`reactor.zig`](the-loop.md#the-reactor)** - the kqueue/epoll demultiplexer.
+  Knows nothing about Python or callbacks; it maps file descriptors to readiness.
+* **[`loop.zig`](the-loop.md#the-loop-engine)** - the actual event loop: timer
+  heap, ready queue, and the `run_once` cycle that drives everything.
 * **The CPython adapter** - the `Loop`, `Transport`, and `Handle` Python types.
   The *only* layer that touches `Python.h`. It translates Python objects into Zig
   calls and back.
@@ -94,14 +94,12 @@ coroutine stepping and TLS - instead of reimplementing famously-subtle code. See
 
 <div class="grid cards" markdown>
 
--   :material-radar: **[The reactor](reactor.md)** - kqueue/epoll, the I/O layer.
+-   :material-sync: **[The loop & the reactor](the-loop.md)** - kqueue/epoll and
+    the run-once cycle.
 
--   :material-sync: **[The loop](the-loop.md)** - the run-once cycle.
-
--   :material-swap-horizontal: **[Transports](transports.md)** - sockets → protocols.
+-   :material-swap-horizontal: **[Transports & lifecycle](transports.md)** -
+    sockets → protocols, and startup → shutdown.
 
 -   :material-recycle: **[What's reused](reuse.md)** - the asyncio boundary.
-
--   :material-timer-sand: **[Lifecycle](lifecycle.md)** - startup, run, shutdown.
 
 </div>
