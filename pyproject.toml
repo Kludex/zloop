@@ -6,7 +6,8 @@ build-backend = "hatchling.build"
 name = "zloop"
 description = "An asyncio event loop with a Zig core."
 readme = "README.md"
-license = "MIT"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "Marcelo Trylesinski", email = "marcelotryle@gmail.com" }]
 classifiers = [

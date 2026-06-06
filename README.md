@@ -66,30 +66,3 @@ zloop/            Python edge - new_event_loop() factory, connection setup
 src/python/*.zig  CPython C-API adapter - Loop, Handle, Transport
 src/core/*.zig    pure-Zig domain - run-once engine, kqueue/epoll reactor, timer heap
 ```
-
-## Develop
-
-```bash
-scripts/install   # venv + deps, then build the Zig extension
-scripts/check     # ruff, mypy, zig fmt
-scripts/test      # pytest under coverage
-scripts/coverage  # 100% gate
-```
-
-CI runs these on macOS (kqueue) and Linux (epoll) across CPython 3.10-3.14.
-
-## Docs
-
-Full usage and architecture docs (with diagrams) build with
-[Zensical](https://zensical.org): `scripts/docs` renders the site, or
-`zensical serve` for a live preview. See [ARCHITECTURE.md](ARCHITECTURE.md) for
-the design in one file.
-
-[zloop.marcelotryle.com](https://zloop.marcelotryle.com) is published to
-Cloudflare on every push to `main` (`.github/workflows/docs.yml`); pull requests
-get a versioned preview. Both need the `CLOUDFLARE_API_TOKEN` and
-`CLOUDFLARE_ACCOUNT_ID` repository secrets.
-
-## Platforms
-
-macOS / BSD (kqueue) and Linux (epoll). Requires CPython 3.12+. MIT licensed.
