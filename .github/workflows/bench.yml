@@ -16,6 +16,8 @@ jobs:
   bench:
     name: Echo benchmark (Ubuntu)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # clone the private repo
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -30,11 +32,8 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
-      - name: Install dependencies (incl. bench group)
+      - name: Install dependencies (incl. bench group, builds the extension)
         run: scripts/install
-
-      - name: Build the extension
-        run: ./build_ext.sh "$(pwd)/.venv/bin/python"
 
       - name: Run benchmark
         run: scripts/bench | tee "$GITHUB_STEP_SUMMARY"
