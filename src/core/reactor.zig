@@ -35,9 +35,61 @@ pub const Event = struct {
 
 pub const Reactor = switch (builtin.os.tag) {
     .macos, .freebsd, .netbsd, .openbsd, .dragonfly => KqueueReactor,
-    .linux => EpollReactor,
+    .linux => LinuxReactor,
     else => @compileError("zloop: unsupported platform for reactor"),
 };
+
+// On Linux the backend is chosen at runtime: epoll by default, io_uring when
+// ZLOOP_IO_URING=1 and the kernel supports it (a comptime switch cannot express
+// "built with io_uring support but absent on this kernel"). Dispatch is a thin
+// tagged-union forward so the loop sees one `Reactor` type either way.
+const LinuxReactor = if (builtin.os.tag == .linux) struct {
+    const uring = @import("uring.zig");
+
+    inner: union(enum) {
+        epoll: EpollReactor,
+        uring: uring.UringPollReactor,
+    },
+
+    pub fn init(allocator: std.mem.Allocator) !LinuxReactor {
+        if (uring.enabled()) {
+            if (uring.UringPollReactor.init(allocator)) |u| {
+                return .{ .inner = .{ .uring = u } };
+            } else |_| {} // fall through to epoll
+        }
+        return .{ .inner = .{ .epoll = try EpollReactor.init(allocator) } };
+    }
+
+    pub fn deinit(self: *LinuxReactor) void {
+        switch (self.inner) {
+            inline else => |*r| r.deinit(),
+        }
+    }
+
+    pub fn register(self: *LinuxReactor, fd: sys.fd_t, token: usize, interest: Interest) !void {
+        switch (self.inner) {
+            inline else => |*r| return r.register(fd, token, interest),
+        }
+    }
+
+    pub fn modify(self: *LinuxReactor, fd: sys.fd_t, token: usize, interest: Interest) !void {
+        switch (self.inner) {
+            inline else => |*r| return r.modify(fd, token, interest),
+        }
+    }
+
+    pub fn unregister(self: *LinuxReactor, fd: sys.fd_t) !void {
+        switch (self.inner) {
+            inline else => |*r| return r.unregister(fd),
+        }
+    }
+
+    pub fn poll(self: *LinuxReactor, out: []Event, timeout_ns: ?u64) ![]Event {
+        switch (self.inner) {
+            inline else => |*r| return r.poll(out, timeout_ns),
+        }
+    }
+} else void;
 
 // ---------------------------------------------------------------------------
 // kqueue backend (macOS / BSD)
@@ -169,7 +221,9 @@ const EpollReactor = struct {
     allocator: std.mem.Allocator,
 
     const TokenInterest = struct { token: usize, interest: Interest };
-    const EPOLL = c.EPOLL;
+    // std.c exposes the epoll_* libc functions and epoll_event, but not the EPOLL
+    // constants struct; take those from std.os.linux (the functions stay libc).
+    const EPOLL = std.os.linux.EPOLL;
 
     pub fn init(allocator: std.mem.Allocator) !EpollReactor {
         const epfd = c.epoll_create1(EPOLL.CLOEXEC);
