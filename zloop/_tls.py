@@ -34,7 +34,7 @@ def start_tls_transport(
         waiter,
         server_side,
         server_hostname,
-        ssl_handshake_timeout=ssl_handshake_timeout,
+        ssl_handshake_timeout=ssl_handshake_timeout,  # type: ignore[arg-type]
         ssl_shutdown_timeout=ssl_shutdown_timeout,
         call_connection_made=True,
     )
@@ -42,4 +42,4 @@ def start_tls_transport(
     # the transport delivers ssl_protocol.connection_made(raw) and begins
     # reading, kicking off the handshake.
     loop._make_transport(sock.fileno(), ssl_protocol, extra)
-    return ssl_protocol._get_app_transport(), waiter
+    return ssl_protocol._get_app_transport(), waiter  # type: ignore[attr-defined]

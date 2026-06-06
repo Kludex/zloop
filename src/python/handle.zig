@@ -198,13 +198,13 @@ var timer_methods = [_]py.MethodDef{
 };
 
 var handle_slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&dealloc)) },
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&handle_methods) },
     .{ .slot = 0, .pfunc = null },
 };
 
 var timer_slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&dealloc)) },
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&timer_methods) },
     .{ .slot = 0, .pfunc = null },
 };

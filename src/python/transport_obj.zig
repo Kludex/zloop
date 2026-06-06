@@ -154,7 +154,30 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
         py.decref(obj);
         return py.raiseRuntime("zloop: could not start reading");
     };
+    trackOnLoop(st); // loop keeps the connection alive until connection_lost
     return obj;
+}
+
+/// Ask the loop to keep this transport alive for the connection's lifetime
+/// (asyncio keeps accepted/connected transports alive until connection_lost).
+/// The loop holds them in a set - a GC root reachable from the running loop -
+/// so they survive even when the protocol does not retain the transport.
+fn trackOnLoop(st: *State) void {
+    callLoopHook(st, "_track_transport");
+}
+fn untrackFromLoop(st: *State) void {
+    callLoopHook(st, "_untrack_transport");
+}
+fn callLoopHook(st: *State, name: [*c]const u8) void {
+    if (st.loop_obj == null) return;
+    const m = py.getAttr(st.loop_obj, name);
+    if (m == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    defer py.decref(m);
+    const r = py.callOneArg(m, st.self_obj);
+    if (r == null) py.c.PyErr_Clear() else py.decref(r);
 }
 
 fn destroyState(st: *State) void {
@@ -485,16 +508,20 @@ fn scheduleConnectionLost(st: *State, exc: py.Object) void {
 
 fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
-    if (st.protocol == null) return py.none();
-    const cl = py.getAttr(st.protocol, "connection_lost");
-    if (cl != null) {
-        defer py.decref(cl);
-        const r = py.callOneArg(cl, exc.?);
-        if (r == null) py.c.PyErr_Clear() else py.decref(r);
-    } else {
-        py.c.PyErr_Clear();
+    if (st.protocol != null) {
+        const cl = py.getAttr(st.protocol, "connection_lost");
+        if (cl != null) {
+            defer py.decref(cl);
+            const r = py.callOneArg(cl, exc.?);
+            if (r == null) py.c.PyErr_Clear() else py.decref(r);
+        } else {
+            py.c.PyErr_Clear();
+        }
+        py.clear(&st.protocol);
     }
-    py.clear(&st.protocol);
+    // The loop no longer needs to keep this connection alive. Do this last: it
+    // may drop the final reference and trigger dealloc.
+    untrackFromLoop(st);
     return py.none();
 }
 
@@ -705,6 +732,7 @@ fn t_set_protocol(self_obj: ?*c.PyObject, proto: ?*c.PyObject) callconv(.c) py.O
 
 fn t_get_protocol(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
+    if (st.protocol == null) return py.none(); // cleared after connection_lost
     return py.newRef(st.protocol);
 }
 
@@ -778,10 +806,10 @@ var methods = [_]py.MethodDef{
 };
 
 var slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&t_dealloc)) },
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&t_dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
-    .{ .slot = c.Py_tp_traverse, .pfunc = @constCast(@ptrCast(&t_traverse)) },
-    .{ .slot = c.Py_tp_clear, .pfunc = @constCast(@ptrCast(&t_clear)) },
+    .{ .slot = c.Py_tp_traverse, .pfunc = @ptrCast(@constCast(&t_traverse)) },
+    .{ .slot = c.Py_tp_clear, .pfunc = @ptrCast(@constCast(&t_clear)) },
     .{ .slot = 0, .pfunc = null },
 };
 

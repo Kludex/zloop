@@ -74,6 +74,16 @@ def test_create_server_with_preexisting_socket(loop: asyncio.AbstractEventLoop) 
     assert run(loop, main()) == b"x"
 
 
+def test_server_get_loop(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> None:
+        server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)
+        assert server.get_loop() is loop
+        server.close()
+        await server.wait_closed()
+
+    run(loop, main())
+
+
 def test_create_server_not_serving_until_started(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> None:
         server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0, start_serving=False)

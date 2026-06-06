@@ -195,14 +195,14 @@ const EpollReactor = struct {
 
     pub fn register(self: *EpollReactor, fd: sys.fd_t, token: usize, interest: Interest) !void {
         if (self.interest.contains(fd)) return error.AlreadyRegistered;
-        var ev = c.epoll_event{ .events = maskOf(interest), .data = .{ .@"u64" = token } };
+        var ev = c.epoll_event{ .events = maskOf(interest), .data = .{ .u64 = token } };
         if (c.epoll_ctl(self.epfd, EPOLL.CTL_ADD, fd, &ev) != 0) return error.RegisterFailed;
         try self.interest.put(fd, .{ .token = token, .interest = interest });
     }
 
     pub fn modify(self: *EpollReactor, fd: sys.fd_t, token: usize, interest: Interest) !void {
         const entry = self.interest.getEntry(fd) orelse return error.NotRegistered;
-        var ev = c.epoll_event{ .events = maskOf(interest), .data = .{ .@"u64" = token } };
+        var ev = c.epoll_event{ .events = maskOf(interest), .data = .{ .u64 = token } };
         if (c.epoll_ctl(self.epfd, EPOLL.CTL_MOD, fd, &ev) != 0) return error.ModifyFailed;
         entry.value_ptr.* = .{ .token = token, .interest = interest };
     }
@@ -231,7 +231,7 @@ const EpollReactor = struct {
             const e = ev.events;
             const hup = (e & (EPOLL.HUP | EPOLL.ERR | EPOLL.RDHUP)) != 0;
             out[count] = .{
-                .token = ev.data.@"u64",
+                .token = ev.data.u64,
                 .readable = (e & EPOLL.IN) != 0 or hup,
                 .writable = (e & EPOLL.OUT) != 0,
                 .hup = hup,

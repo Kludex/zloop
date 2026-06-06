@@ -476,8 +476,8 @@ const StopCallback = struct {
         py.freeInstance(@ptrCast(o));
     }
     var sc_slots = [_]py.Slot{
-        .{ .slot = c.Py_tp_call, .pfunc = @constCast(@ptrCast(&scCall)) },
-        .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&scDealloc)) },
+        .{ .slot = c.Py_tp_call, .pfunc = @ptrCast(@constCast(&scCall)) },
+        .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&scDealloc)) },
         .{ .slot = 0, .pfunc = null },
     };
     var sc_spec = py.Spec{
@@ -732,8 +732,8 @@ var methods = [_]py.MethodDef{
 };
 
 var slots = [_]py.Slot{
-    .{ .slot = c.Py_tp_new, .pfunc = @constCast(@ptrCast(&new)) },
-    .{ .slot = c.Py_tp_dealloc, .pfunc = @constCast(@ptrCast(&dealloc)) },
+    .{ .slot = c.Py_tp_new, .pfunc = @ptrCast(@constCast(&new)) },
+    .{ .slot = c.Py_tp_dealloc, .pfunc = @ptrCast(@constCast(&dealloc)) },
     .{ .slot = c.Py_tp_methods, .pfunc = @ptrCast(&methods) },
     .{ .slot = 0, .pfunc = null },
 };

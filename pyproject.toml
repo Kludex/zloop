@@ -59,3 +59,16 @@ select = ["E", "F", "I", "FA", "UP", "RUF100"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
+
+[tool.mypy]
+strict = true
+warn_unused_ignores = true
+show_error_codes = true
+files = ["zloop"]
+
+[[tool.mypy.overrides]]
+# The connection-setup layer deliberately widens the asyncio loop method
+# signatures (Any / **_) the same way uvloop's stubs do; those intentional
+# overrides and Any-returns aren't real type errors.
+module = "zloop._io"
+disable_error_code = ["override", "no-any-return"]

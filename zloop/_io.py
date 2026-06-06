@@ -81,6 +81,9 @@ class _Server(asyncio.AbstractServer):
     def is_serving(self) -> bool:
         return self._active
 
+    def get_loop(self) -> Loop:
+        return self._loop
+
     def _start_serving(self) -> None:
         if self._active:
             return
@@ -150,11 +153,28 @@ class _Server(asyncio.AbstractServer):
         await self.wait_closed()
 
 
-class Loop(_zloop.Loop):  # type: ignore[misc,valid-type]
+class Loop(_zloop.Loop):
     """The public zloop event loop: the Zig engine plus connection setup."""
 
     _default_executor: concurrent.futures.Executor | None = None
     _executor_shutdown_called: bool = False
+    _transports: set[Any]
+
+    # -- transport lifetime ---------------------------------------------------
+    #
+    # asyncio keeps accepted/connected transports alive until connection_lost
+    # even if the protocol does not retain them. The Zig transport calls these
+    # back; the set is a GC root reachable from the running loop.
+
+    def _track_transport(self, transport: Any) -> None:
+        try:
+            self._transports.add(transport)
+        except AttributeError:
+            self._transports = {transport}
+
+    def _untrack_transport(self, transport: Any) -> None:
+        # _untrack only follows a _track, so the set always exists here.
+        self._transports.discard(transport)
 
     # -- executors ------------------------------------------------------------
 
