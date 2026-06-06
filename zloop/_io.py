@@ -464,6 +464,8 @@ class Loop(_zloop.Loop):
                 sock = socket.socket(af, socktype, pr)
                 sock.setblocking(False)
                 try:
+                    if local_addr is not None:
+                        sock.bind(local_addr)
                     await self._sock_connect(sock, address)
                     break
                 except OSError as exc:

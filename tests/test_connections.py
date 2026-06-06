@@ -132,6 +132,27 @@ def test_create_connection_refused(loop: asyncio.AbstractEventLoop) -> None:
     run(loop, main())
 
 
+def test_create_connection_local_addr(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> tuple:
+        server, host, port = await _echo_server(loop)
+        got: asyncio.Future[tuple] = loop.create_future()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                if not got.done():
+                    got.set_result(transport.get_extra_info("sockname"))
+                transport.close()
+
+        await loop.create_connection(Client, host, port, local_addr=("127.0.0.1", 0))
+        sockname = await asyncio.wait_for(got, 2.0)
+        server.close()
+        await server.wait_closed()
+        return sockname
+
+    sockname = run(loop, main())
+    assert sockname[0] == "127.0.0.1"
+
+
 def test_transport_writelines(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> bytes:
         server, host, port = await _echo_server(loop)
