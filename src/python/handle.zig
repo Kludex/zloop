@@ -20,8 +20,9 @@ pub const HandleObject = extern struct {
     /// Zig timer seq used to cancel the scheduled timer.
     when: f64,
     timer_seq: u64,
-    /// Back-pointer to the owning loop object, borrowed, so cancel() can reach
-    /// the Zig timer queue. Null for plain (call_soon) handles.
+    /// Owned reference to the loop, so cancel() / exception reporting can touch
+    /// it safely even if the user drops the loop while holding the handle
+    /// (matches asyncio.Handle, which keeps self._loop).
     loop_obj: py.Object,
 };
 
@@ -55,7 +56,7 @@ pub fn create(
     h.is_timer = if (is_timer) 1 else 0;
     h.when = 0;
     h.timer_seq = 0;
-    h.loop_obj = loop_obj; // borrowed
+    h.loop_obj = py.newRef(loop_obj); // owned - keeps the loop alive for cancel()
     return obj;
 }
 
@@ -150,6 +151,7 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     py.xdecref(self.callback);
     py.xdecref(self.args);
     py.xdecref(self.context);
+    py.xdecref(self.loop_obj);
     py.freeInstance(@ptrCast(self));
 }
 
