@@ -34,7 +34,7 @@ uvicorn uses for `uvloop` and `asyncio` - `module:callable`.
 
 If you run uvicorn programmatically, set `loop` on the `Config`:
 
-```python title="server.py" hl_lines="11"
+```python title="server.py" hl_lines="12"
 import uvicorn
 
 

@@ -50,7 +50,7 @@ $ pip install zloop
 
 Let's create the simplest possible thing: run a coroutine on zloop.
 
-```python title="main.py" hl_lines="9"
+```python title="main.py" hl_lines="10"
 import asyncio
 
 import zloop

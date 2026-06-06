@@ -14,7 +14,7 @@ clean one-liner.
 
 ## `anyio.run()`
 
-```python title="main.py" hl_lines="13"
+```python title="main.py" hl_lines="17"
 import anyio
 
 import zloop
