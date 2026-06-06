@@ -110,6 +110,8 @@ pub const Loop = struct {
         errdefer r.deinit();
 
         const pipe = try sys.pipe();
+        errdefer sys.close(pipe[0]);
+        errdefer sys.close(pipe[1]);
         try sys.setNonBlocking(pipe[0]);
         try sys.setNonBlocking(pipe[1]);
         try sys.setCloexec(pipe[0]);
@@ -179,7 +181,9 @@ pub const Loop = struct {
         self.xlock.unlock();
         defer self.allocator.free(items);
         for (items) |token| {
-            self.ready.push(token) catch {};
+            // If the ready queue can't grow (OOM), release the token's resources
+            // (the embedder's Handle ref) rather than leaking it.
+            self.ready.push(token) catch self.dispatcher.drop(self.dispatcher.ctx, token);
         }
     }
 
@@ -317,7 +321,9 @@ pub const Loop = struct {
 
         const t_now = clock.nowNs();
         while (self.timers.popDue(t_now)) |timer| {
-            try self.ready.push(timer.token);
+            // The timer is already popped; on OOM release its token rather than
+            // erroring out of the loop and leaking the Handle ref.
+            self.ready.push(timer.token) catch self.dispatcher.drop(self.dispatcher.ctx, timer.token);
         }
 
         var n = self.ready.len();

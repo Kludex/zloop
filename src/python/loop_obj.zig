@@ -23,7 +23,6 @@ pub const LoopObject = extern struct {
     exception_handler: py.Object,
     task_factory: py.Object,
     default_executor: py.Object,
-    asyncgens: py.Object, // a set
     debug: u8,
     closed: u8,
     /// Thread id that is running the loop, or 0 when not running. Used by
@@ -90,7 +89,6 @@ fn new(tp: [*c]c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py
     self.exception_handler = py.none();
     self.task_factory = py.none();
     self.default_executor = py.none();
-    self.asyncgens = c.PySet_New(null);
     self.debug = 0;
     self.closed = 0;
     self.thread_id = 0;
@@ -124,7 +122,6 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     py.xdecref(self.exception_handler);
     py.xdecref(self.task_factory);
     py.xdecref(self.default_executor);
-    py.xdecref(self.asyncgens);
     py.freeInstance(@ptrCast(self));
 }
 
@@ -318,6 +315,7 @@ fn create_future(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object
     const args = py.emptyTuple();
     defer py.decref(args);
     const kwargs = c.PyDict_New();
+    if (kwargs == null) return null;
     defer py.decref(kwargs);
     _ = c.PyDict_SetItemString(kwargs, "loop", self_obj);
     return py.callTupleKw(future_cls, args, kwargs);
@@ -344,6 +342,7 @@ fn create_task(self_obj: ?*c.PyObject, args: ?*c.PyObject, kwargs: ?*c.PyObject)
     defer py.decref(targs);
     py.tupleSet(targs, 0, py.newRef(coro));
     const tkwargs = if (kwargs != null) py.newRef(kwargs) else c.PyDict_New();
+    if (tkwargs == null) return null;
     defer py.decref(tkwargs);
     _ = c.PyDict_SetItemString(tkwargs, "loop", self_obj);
     return py.callTupleKw(cls, targs, tkwargs);
@@ -405,9 +404,11 @@ fn run_until_complete(self_obj: ?*c.PyObject, future: ?*c.PyObject) callconv(.c)
     // future = ensure_future(future, loop=self), via the cached callable.
     const ensure = ensure_future_fn;
     const ef_args = py.tupleNew(1);
+    if (ef_args == null) return null;
     defer py.decref(ef_args);
     py.tupleSet(ef_args, 0, py.newRef(future.?));
     const ef_kwargs = c.PyDict_New();
+    if (ef_kwargs == null) return null;
     defer py.decref(ef_kwargs);
     _ = c.PyDict_SetItemString(ef_kwargs, "loop", self_obj);
     const fut = py.callTupleKw(ensure, ef_args, ef_kwargs);
