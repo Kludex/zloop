@@ -58,6 +58,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # cibuildwheel's build[uv] frontend needs uv on PATH; the manylinux
+      # containers ship it, the macOS runner does not.
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
       - name: Build wheels
         uses: pypa/cibuildwheel@d16cc544083d96996f923fc4b318fee3cb14b34e # v3.4.1
 
