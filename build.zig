@@ -41,6 +41,9 @@ pub fn build(b: *std.Build) void {
     });
     mod.addIncludePath(.{ .cwd_relative = py_include });
     mod.addImport("core", core_mod);
+    // Provide atomic helpers the free-threaded headers declare but Zig's
+    // translate-c can't inline; harmless (unreferenced) on non-free-threaded builds.
+    mod.addCSourceFile(.{ .file = b.path("src/python/ft_atomics.c") });
 
     const lib = b.addLibrary(.{
         .name = "_zloop",
