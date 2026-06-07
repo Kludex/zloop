@@ -124,14 +124,16 @@ pub const Completor = struct {
         };
     }
 
-    /// Queue a single-shot recv for `fd` drawing from the provided-buffer ring.
-    /// The transport re-submits after each completion (one recv in flight per fd).
-    /// Single-shot (not multishot) for delivery predictability across kernels;
-    /// multishot can be a later optimization. Not submitted here - reap flushes it.
+    /// Queue a multishot recv for `fd` drawing from the provided-buffer ring: the
+    /// kernel keeps it armed and posts a CQE per arrival (F_MORE set), so the
+    /// transport does not re-submit per message. It only needs re-arming when the
+    /// kernel drops F_MORE (e.g. the buffer ring momentarily ran dry). Not
+    /// submitted here - reap flushes it.
     pub fn submitRecv(self: *Completor, fd: sys.fd_t, ud: u64) !void {
         const sqe = try self.ensureSqe();
         sqe.prep_rw(.RECV, fd, 0, 0, 0);
         sqe.rw_flags = 0;
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
         sqe.flags |= linux.IOSQE_BUFFER_SELECT;
         sqe.buf_index = self.bufs.group_id;
         sqe.user_data = ud;

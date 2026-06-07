@@ -614,6 +614,16 @@ pub const Loop = struct {
         defer if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
         const cb = self.comp_fds.get(fd) orelse return; // gone fd
         cb.fire(.{ .kind = kind, .bytes = comp.result, .buf = comp.buf });
+
+        // Multishot recv: the kernel keeps it armed (F_MORE) and posts a CQE per
+        // arrival, so the transport never re-arms per message. Only resubmit when
+        // the kernel dropped F_MORE on a still-live read stream (e.g. the buffer
+        // ring momentarily ran dry) - and only if the fd is still being read.
+        if (kind == .recv and comp.result > 0 and comp.flags & completion.F_MORE == 0) {
+            if (self.comp_fds.get(fd)) |live| {
+                self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, live.gen)) catch {};
+            }
+        }
     }
 
     /// Register `cb` as the completion handler for `fd` and submit a recv. The
@@ -625,14 +635,6 @@ pub const Loop = struct {
         entry.gen = g;
         try self.comp_fds.put(fd, entry);
         try self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g));
-    }
-
-    /// Re-arm a recv after a completion (single-shot recv, one in flight per fd).
-    /// Keeps the same recv generation - it continues the same logical read stream.
-    pub fn rearmRecv(self: *Loop, fd: sys.fd_t) void {
-        if (!has_completion) return;
-        const g = (self.comp_gen.get(fd) orelse return).recv;
-        self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g)) catch {};
     }
 
     /// Submit a send of `buf` (kernel-borrowed until completion; caller pins it).

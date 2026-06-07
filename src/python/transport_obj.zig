@@ -388,8 +388,10 @@ fn stopReading(st: *State) void {
 }
 
 /// Completion-backend read callback: the kernel already recv'd into `res.buf`.
-/// Build a PyBytes from it (the GIL is held here), deliver data_received, then
-/// re-arm the recv. res.bytes==0 is a clean EOF; <0 is -errno.
+/// Build a PyBytes from it (the GIL is held here) and deliver data_received. The
+/// recv is multishot - the kernel keeps it armed and the loop handles any re-arm
+/// when F_MORE drops - so this never re-submits. res.bytes==0 is a clean EOF;
+/// <0 is -errno.
 fn readCompleted(ctx: *anyopaque, res: core.IoResult) void {
     const st: *State = @ptrCast(@alignCast(ctx));
     if (st.conn_lost or !st.reading) return;
@@ -413,8 +415,6 @@ fn readCompleted(ctx: *anyopaque, res: core.IoResult) void {
         }
         py.decref(r);
     }
-    // Single-shot recv: re-arm for the next message if still reading.
-    if (st.reading and !st.conn_lost) st.engine.rearmRecv(st.fd);
 }
 
 fn handleEof(st: *State) void {
