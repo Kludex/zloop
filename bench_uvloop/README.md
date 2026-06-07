@@ -64,21 +64,28 @@ Completion is not for this case (see below).
 
 ### Free-threaded parallel loops (GIL off, CPython 3.14t)
 
-N independent zloop loops on N threads, 8 conns/thread, 1 KB messages, 2s each.
-This is what the io_uring completion backend is *for*: once the GIL stops
-serializing the loops, completion scales ahead of epoll, and the gap widens with
-parallelism (12-CPU host).
+N independent loops on N threads, 8 conns/thread, 1 KB messages, 2s each, 3-sample
+medians (12-CPU host). uvloop runs here too: it imports on 3.14t without forcing
+the GIL back on and drives one loop per thread fine.
 
-| threads | epoll req/s | io_uring req/s | io_uring speedup |
-| ------: | ----------: | -------------: | ---------------: |
-|       1 |     154,998 |        161,489 | +4.2%            |
-|       2 |     283,160 |        295,641 | +4.4%            |
-|       4 |     456,343 |        513,942 | +12.6%           |
-|       8 |    ~677,000 |       ~776,000 | **+15%**         |
-|      16 |    ~831,000 |       ~991,000 | **+20%**         |
+| threads | zloop epoll | zloop io_uring | uvloop    | completion vs epoll |
+| ------: | ----------: | -------------: | --------: | ------------------: |
+|       1 |     154,511 |        153,869 |   169,291 | -0.4%               |
+|       2 |     272,715 |        289,157 |   315,506 | +6.0%               |
+|       4 |     424,232 |        474,653 |   568,518 | +11.9%              |
+|       8 |     649,797 |        741,102 |   964,408 | +14.0%              |
+|      16 |     729,711 |        834,004 | 1,133,503 | +14.3%              |
 
-The 8/16-thread rows are 3-sample medians (single samples are noisy under
-oversubscription). Enable it with `ZLOOP_IO_URING=completion`.
+Two honest readings:
+
+- The io_uring completion backend **does** beat zloop's own epoll default once the
+  loops parallelize off the GIL (~+14% at 8-16 threads) - that's the design point.
+- But **uvloop wins outright at every thread count** (~25-35% ahead of completion).
+  So free-threaded parallelism is not yet a place where zloop beats uvloop; the
+  single-loop epoll wins above are. Catching uvloop here is open work (see the PR's
+  deferred items: multishot recv, batched submits, completion-path writes).
+
+Enable the completion backend with `ZLOOP_IO_URING=completion`.
 
 ## Caveats
 
