@@ -33,8 +33,14 @@ graph LR
     R -->|Linux| E["epoll"]
 ```
 
-The right backend is chosen at **compile time** from the target OS - there's no
-runtime branching.
+The right *readiness* backend is chosen at **compile time** from the target OS -
+there's no runtime branching between kqueue and epoll.
+
+!!! note "There's also a completion backend"
+    Everything on this page describes the **readiness** reactor, zloop's default.
+    Linux also has an opt-in io_uring **completion** backend (a different I/O model
+    entirely, selected at *runtime* via `ZLOOP_IO_URING=completion`). It's covered
+    on its own page: [The completion backend](completion.md).
 
 ### The API
 
