@@ -99,30 +99,12 @@ This runs unit tests for the reactor (and the timer heap, and the ready queue)
 directly, without ever starting CPython. That separation is the payoff of keeping
 this layer pure. 🙂
 
-## Platform backends: kqueue, epoll, and io_uring
+## Platform backends: kqueue vs epoll
 
 The reactor is backend-agnostic on the surface, but underneath it talks to a
 different OS mechanism on each platform: **kqueue** on macOS and the BSDs,
 **epoll** on Linux. Both answer the same question - *"which of these file
 descriptors are ready?"* - so they map cleanly onto one interface.
-
-The key idea: kqueue and epoll are **readiness** APIs, while the newer
-**io_uring** is a **completion** API. That's the real divide.
-
-```mermaid
-graph TD
-    Z["zloop reactor"]
-    Z -->|readiness| RD["<b>Readiness</b><br/>OS says 'ready', you do the I/O"]
-    Z -.->|"completion (planned)"| CO["<b>Completion</b><br/>OS does the I/O, says 'done'"]
-    RD --> K2["kqueue<br/>macOS / BSD"]
-    RD --> E2["epoll<br/>Linux"]
-    CO -.-> U2["io_uring<br/>Linux 5.1+"]
-```
-
-zloop uses kqueue and epoll today. io_uring is a future direction (see
-[below](#io_uring-a-future-direction)).
-
-### kqueue vs epoll
 
 They solve the same problem and are conceptually twins. The differences are in
 API shape and breadth:
@@ -158,59 +140,6 @@ zloop deliberately does **not** push timers or signals into kqueue (even though
 kqueue could host them natively). Keeping its own timer heap and a self-pipe for
 signals means the timer logic is one piece of shared, cross-platform Zig, and the
 two backends stay symmetric behind the same interface.
-
-### io_uring: a future direction
-
-[io_uring](https://en.wikipedia.org/wiki/Io_uring) (Linux 5.1+) is **not** a
-readiness API - it's an **asynchronous completion** API, closer in spirit to
-Windows IOCP than to epoll. The difference is fundamental:
-
-=== "Readiness (epoll / kqueue)"
-
-    ```text
-    wait        ->  "socket is readable"   (the OS tells you it's ready)
-    read(fd)    ->  you make the syscall to actually read the bytes
-    ```
-
-=== "Completion (io_uring)"
-
-    ```text
-    submit "read(fd, buf)"   ->  you describe the operation up front
-      ... do other work ...
-    reap        ->  "that read finished, N bytes are already in buf"
-    ```
-
-Mechanically, io_uring shares two ring buffers between your process and the
-kernel: a **submission queue** you write operations into, and a **completion
-queue** the kernel posts results to. The advantages:
-
-* **Far fewer syscalls** - many operations batch into one `io_uring_enter()`, and
-  with kernel-side polling you can reach *zero* syscalls in steady state. epoll
-  and kqueue still cost a syscall to learn readiness *plus* one per
-  `read`/`write`.
-* **Truly async for things with no readiness model** - regular file I/O,
-  `fsync`, `accept`, `connect`, even `openat`. (To epoll a disk file is "always
-  ready" yet a `read` on it can still block; io_uring can do it asynchronously.)
-
-The cost is a more complex model - you manage the rings, buffer ownership across
-the async gap, and behavior that varies by kernel version - and it is Linux-only
-and comparatively new.
-
-!!! info "Planned, not built"
-    An io_uring backend is on the roadmap; it isn't implemented yet. zloop runs
-    on kqueue and epoll today.
-
-It would be a **third backend with a different internal contract**, not a drop-in
-swap. The reactor's job changes from *"register interest, report readiness,
-caller does the I/O"* to *"submit operations, report completions"* - and that
-ripples up into the [transport](transports.md), which would hand the kernel a
-buffer and await "done" rather than waiting for "readable" and then reading.
-
-io_uring also has a `POLL_ADD` operation that behaves like epoll, so it *can* be
-adopted incrementally as a readiness backend first, then deepened into true
-completion I/O. That's the likely path - the same way libuv and uvloop have been
-gaining io_uring support - and it's an **addition** for the Linux fast path,
-precisely because completion is a different shape from readiness.
 
 ## The loop engine
 
