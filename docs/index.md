@@ -9,12 +9,10 @@ icon: lucide/zap
 </p>
 
 <p align="center">
-    <em>An asyncio event loop with a Zig core - a drop-in, faster-than-uvloop alternative.</em>
+    <em>An asyncio event loop with a Zig core! :zap:</em>
 </p>
 
 ---
-
-**Documentation**: you are reading it 🙂
 
 **Source Code**: <a href="https://github.com/Kludex/zloop" target="_blank">https://github.com/Kludex/zloop</a>
 
