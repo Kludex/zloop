@@ -29,25 +29,32 @@ pub fn enabled() bool {
 /// What kind of op a Completion is for. Encoded in the high bits of user_data so
 /// reap can route a CQE without a side table, and so a stale CQE for a reused fd
 /// is filtered by its generation (see UserData).
-pub const OpKind = enum(u2) { recv = 0, send = 1, cancel = 2, wake = 3 };
+pub const OpKind = enum(u3) { recv = 0, send = 1, cancel = 2, wake = 3, poll = 4 };
 
-/// user_data layout: [ gen:30 | kind:2 | fd:32 ]. The generation is bumped per
+// POLLIN/POLLOUT/HUP/ERR for POLL_ADD ops (accept, connect, signals - the fds
+// that aren't plain-socket data and so use readiness-in-completion, not recv).
+const POLLIN: u32 = 0x001;
+const POLLOUT: u32 = 0x004;
+const POLLERR: u32 = 0x008;
+const POLLHUP: u32 = 0x010;
+
+/// user_data layout: [ gen:29 | kind:3 | fd:32 ]. The generation is bumped per
 /// registration so a late CQE from a closed-then-reused fd is dropped.
 pub const UserData = struct {
     pub fn make(op_kind: OpKind, op_fd: sys.fd_t, op_gen: u32) u64 {
         const ufd: u64 = @as(u32, @bitCast(op_fd));
         const ukind: u64 = @intFromEnum(op_kind);
-        const ugen: u64 = op_gen & 0x3FFF_FFFF;
-        return (ugen << 34) | (ukind << 32) | ufd;
+        const ugen: u64 = op_gen & 0x1FFF_FFFF;
+        return (ugen << 35) | (ukind << 32) | ufd;
     }
     pub fn fd(ud: u64) sys.fd_t {
         return @bitCast(@as(u32, @truncate(ud)));
     }
     pub fn kind(ud: u64) OpKind {
-        return @enumFromInt(@as(u2, @truncate(ud >> 32)));
+        return @enumFromInt(@as(u3, @truncate(ud >> 32)));
     }
     pub fn gen(ud: u64) u32 {
-        return @truncate(ud >> 34);
+        return @truncate(ud >> 35);
     }
 };
 
@@ -60,9 +67,15 @@ pub const Completion = struct {
     flags: u32,
     buf: []const u8 = &.{},
     buf_id: ?u16 = null,
+    // For poll (readiness) completions:
+    readable: bool = false,
+    writable: bool = false,
+    hup: bool = false,
 };
 
 pub const WAKE_UD: u64 = std.math.maxInt(u64);
+/// Re-export so the loop can test multishot continuation without importing linux.
+pub const F_MORE: u32 = linux.IORING_CQE_F_MORE;
 
 const RECV_GROUP: u16 = 1;
 const RECV_BUF_SIZE: u32 = 64 * 1024;
@@ -103,6 +116,17 @@ pub const Completor = struct {
     /// multishot can be a later optimization.
     pub fn submitRecv(self: *Completor, fd: sys.fd_t, ud: u64) !void {
         _ = self.bufs.recv(ud, fd, 0) catch return error.SubmitFailed;
+        _ = self.ring.submit() catch return error.SubmitFailed;
+    }
+
+    /// Submit a multishot POLL_ADD for readiness (accept/connect/signals - fds
+    /// that aren't plain-socket data). Re-arms until F_MORE clears.
+    pub fn submitPoll(self: *Completor, fd: sys.fd_t, want_read: bool, want_write: bool, ud: u64) !void {
+        var mask: u32 = 0;
+        if (want_read) mask |= POLLIN;
+        if (want_write) mask |= POLLOUT;
+        const sqe = self.ring.poll_add(ud, fd, mask) catch return error.SubmitFailed;
+        sqe.len |= linux.IORING_POLL_ADD_MULTI;
         _ = self.ring.submit() catch return error.SubmitFailed;
     }
 
@@ -152,12 +176,18 @@ pub const Completor = struct {
         for (cqes[0..n]) |cqe| {
             if (cqe.user_data == WAKE_UD) continue; // our timeout op
             var comp = Completion{ .user_data = cqe.user_data, .result = cqe.res, .flags = cqe.flags };
-            if (UserData.kind(cqe.user_data) == .recv and cqe.res > 0 and (cqe.flags & linux.IORING_CQE_F_BUFFER) != 0) {
+            const knd = UserData.kind(cqe.user_data);
+            if (knd == .recv and cqe.res > 0 and (cqe.flags & linux.IORING_CQE_F_BUFFER) != 0) {
                 const bid = cqe.buffer_id() catch null;
                 if (bid) |id| {
                     comp.buf = self.bufs.get_by_id(id)[0..@intCast(cqe.res)];
                     comp.buf_id = id;
                 }
+            } else if (knd == .poll and cqe.res >= 0) {
+                const e: u32 = @intCast(cqe.res);
+                comp.hup = (e & (POLLHUP | POLLERR)) != 0;
+                comp.readable = (e & POLLIN) != 0 or comp.hup;
+                comp.writable = (e & POLLOUT) != 0;
             }
             out[count] = comp;
             count += 1;

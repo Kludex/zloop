@@ -192,9 +192,11 @@ pub const Loop = struct {
             self.completor = null; // unsupported kernel -> stay on readiness
             return;
         };
-        // Move the wake pipe off the reactor and onto a completion recv.
+        // Move the wake pipe off the reactor and onto a completion POLL_ADD
+        // (readiness, not a data recv - it's drained by drainWake, and a buffer
+        // recv on a pipe is the wrong tool and unreliable across kernels).
         self.reactor.unregister(self.wake_r) catch {};
-        self.completor.?.submitRecv(self.wake_r, completion.WAKE_UD) catch {};
+        self.completor.?.submitPoll(self.wake_r, true, false, completion.WAKE_UD) catch {};
     }
 
     /// True when this loop is using the io_uring completion backend.
@@ -353,6 +355,16 @@ pub const Loop = struct {
     }
 
     fn syncFdReg(self: *Loop, fd: sys.fd_t, state: FdState, is_new: bool) !void {
+        if (has_completion and self.completor != null) {
+            // On the completion backend, readiness for non-data fds (accept,
+            // connect, signals) is a multishot POLL_ADD. modify = cancel + re-arm.
+            const i = state.interest();
+            const g = (self.comp_gen.get(fd) orelse 0) +% 1;
+            try self.comp_gen.put(fd, g);
+            if (!is_new) self.completor.?.cancel(completion.UserData.make(.poll, fd, g -% 1), completion.WAKE_UD);
+            try self.completor.?.submitPoll(fd, i.read, i.write, completion.UserData.make(.poll, fd, g));
+            return;
+        }
         if (is_new) {
             try self.reactor.register(fd, fdToken(fd), state.interest());
         } else {
@@ -361,6 +373,20 @@ pub const Loop = struct {
     }
 
     fn syncFdUnreg(self: *Loop, fd: sys.fd_t, state: FdState) void {
+        if (has_completion and self.completor != null) {
+            const g = self.comp_gen.get(fd) orelse 0;
+            if (state.isEmpty()) {
+                self.completor.?.cancel(completion.UserData.make(.poll, fd, g), completion.WAKE_UD);
+                self.comp_gen.put(fd, g +% 1) catch {};
+                _ = self.fds.remove(fd);
+            } else {
+                self.completor.?.cancel(completion.UserData.make(.poll, fd, g), completion.WAKE_UD);
+                const ng = g +% 1;
+                self.comp_gen.put(fd, ng) catch {};
+                self.completor.?.submitPoll(fd, state.interest().read, state.interest().write, completion.UserData.make(.poll, fd, ng)) catch {};
+            }
+            return;
+        }
         if (state.isEmpty()) {
             self.reactor.unregister(fd) catch {};
             _ = self.fds.remove(fd);
@@ -487,23 +513,45 @@ pub const Loop = struct {
         // in `ready` via drainXthread at the top of runOnce.
         if (comp.user_data == completion.WAKE_UD) {
             self.drainWake();
-            co.submitRecv(self.wake_r, completion.WAKE_UD) catch {};
+            // Re-arm the wake poll if the multishot stopped.
+            if (comp.flags & completion.F_MORE == 0) {
+                co.submitPoll(self.wake_r, true, false, completion.WAKE_UD) catch {};
+            }
             return;
         }
         const fd = completion.UserData.fd(comp.user_data);
         const gen = completion.UserData.gen(comp.user_data);
-        // Recycle a recv buffer regardless of whether we still have a callback,
-        // so the kernel ring never starves on a closed connection.
-        defer if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
-
-        const cb = self.comp_fds.get(fd) orelse return; // gone fd
+        const kind = completion.UserData.kind(comp.user_data);
         // Drop a late CQE whose generation no longer matches (fd was reused).
-        if ((self.comp_gen.get(fd) orelse gen) != gen) return;
-        cb.fire(.{
-            .kind = completion.UserData.kind(comp.user_data),
-            .bytes = comp.result,
-            .buf = comp.buf,
-        });
+        if ((self.comp_gen.get(fd) orelse gen) != gen) {
+            if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
+            return;
+        }
+
+        if (kind == .poll) {
+            // Readiness (accept/connect/signals): fire reader/writer like the
+            // reactor path, then re-arm if the multishot poll stopped.
+            if (self.fds.get(fd)) |state| {
+                const io: IoEvent = .{ .readable = comp.readable, .writable = comp.writable, .hup = comp.hup };
+                if (comp.readable or comp.hup) if (state.reader) |cb| cb.fire(io);
+                if (comp.writable or comp.hup) if (state.writer) |cb| cb.fire(io);
+            }
+            if (comp.flags & completion.F_MORE == 0) {
+                if (self.fds.get(fd)) |state| {
+                    if (!state.isEmpty()) {
+                        const i = state.interest();
+                        self.completor.?.submitPoll(fd, i.read, i.write, comp.user_data) catch {};
+                    }
+                }
+            }
+            return;
+        }
+
+        // Data completion (recv/send): recycle the recv buffer, deliver to the
+        // transport's completion callback.
+        defer if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
+        const cb = self.comp_fds.get(fd) orelse return; // gone fd
+        cb.fire(.{ .kind = kind, .bytes = comp.result, .buf = comp.buf });
     }
 
     /// Register `cb` as the completion handler for `fd` and submit a recv. The

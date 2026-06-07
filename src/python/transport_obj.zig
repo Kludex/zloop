@@ -361,9 +361,60 @@ fn deliverData(st: *State) void {
     }
 }
 
+/// Plain (non-buffered) connections use the completion backend when active;
+/// buffered/SSL connections stay on readiness because the kernel can't hold the
+/// protocol's get_buffer() buffer across the async gap.
+fn usesCompletion(st: *State) bool {
+    return st.engine.isCompletion() and !st.buffered;
+}
+
 fn startReading(st: *State) !void {
-    try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
+    if (usesCompletion(st)) {
+        try st.engine.startRecv(st.fd, .{ .func = readCompleted, .ctx = st });
+    } else {
+        try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
+    }
     st.reading = true;
+}
+
+/// Stop reading on whichever backend this connection uses.
+fn stopReading(st: *State) void {
+    if (usesCompletion(st)) {
+        st.engine.stopIo(st.fd);
+    } else {
+        _ = st.engine.removeReader(st.fd);
+    }
+    st.reading = false;
+}
+
+/// Completion-backend read callback: the kernel already recv'd into `res.buf`.
+/// Build a PyBytes from it (the GIL is held here), deliver data_received, then
+/// re-arm the recv. res.bytes==0 is a clean EOF; <0 is -errno.
+fn readCompleted(ctx: *anyopaque, res: core.IoResult) void {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    if (st.conn_lost or !st.reading) return;
+    if (res.bytes == 0) {
+        handleEof(st);
+        return;
+    }
+    if (res.bytes < 0) {
+        fatalError(st, error.RecvFailed);
+        return;
+    }
+    const data = py.c.PyBytes_FromStringAndSize(res.buf.ptr, @intCast(res.buf.len));
+    if (data == null) {
+        py.c.PyErr_Clear();
+    } else {
+        const r = protoCall1(st, "data_received", data);
+        py.decref(data);
+        if (r == null) {
+            reportProtocolError(st, "data_received");
+            return;
+        }
+        py.decref(r);
+    }
+    // Single-shot recv: re-arm for the next message if still reading.
+    if (st.reading and !st.conn_lost) st.engine.rearmRecv(st.fd);
 }
 
 fn handleEof(st: *State) void {
@@ -385,8 +436,7 @@ fn handleEof(st: *State) void {
         closeTransport(st, null);
     } else {
         // protocol wants the connection kept half-open: stop reading for good.
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
         st.read_eof = true;
     }
 }
@@ -525,8 +575,7 @@ fn doConnectionLost(st: *State, exc: py.Object) void {
 
     stopWriting(st);
     if (st.reading) {
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
     }
     closeFd(st);
 
@@ -619,7 +668,7 @@ fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     py.clear(&t.dict);
     if (t.state) |st| {
         if (!st.conn_lost) {
-            if (st.reading) _ = st.engine.removeReader(st.fd);
+            if (st.reading) stopReading(st);
             stopWriting(st);
             closeFd(st);
         }
@@ -652,10 +701,7 @@ fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
         // Detach from the engine before dropping the Loop reference, so a later
         // dealloc cannot touch a freed engine through st.engine.
         if (!st.conn_lost) {
-            if (st.reading) {
-                _ = st.engine.removeReader(st.fd);
-                st.reading = false;
-            }
+            if (st.reading) stopReading(st);
             stopWriting(st);
             closeFd(st);
             st.conn_lost = true;
@@ -709,8 +755,7 @@ fn t_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (!st.closing and !st.conn_lost) {
         if (st.reading) {
-            _ = st.engine.removeReader(st.fd);
-            st.reading = false;
+            stopReading(st);
         }
         closeTransport(st, null);
     }
@@ -743,8 +788,7 @@ fn t_is_closing(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
 fn t_pause_reading(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (st.reading and !st.conn_lost) {
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
     }
     return py.none();
 }

@@ -108,6 +108,9 @@ fn new(tp: [*c]c.PyTypeObject, _: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py
         py.decref(obj);
         return py.raiseRuntime("zloop: failed to initialise engine");
     };
+    // Enable the io_uring completion backend now that the engine is at its final
+    // heap address (the Completor is self-referential). No-op unless opted in.
+    engine.setupCompletion();
     self.engine = engine;
     return obj;
 }
