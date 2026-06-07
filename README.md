@@ -29,10 +29,9 @@ uvicorn app:app --loop zloop:new_event_loop
 - **Correct.** Passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
   test suite (1048 tests), identical to stock asyncio, plus its own suite at
   **100%** coverage.
-- **Fast.** Faster than uvloop on the workloads measured so far - scheduling,
-  timers, and small/medium-message socket throughput (e.g. `call_soon` +46%,
-  1 KiB buffered echo +6% on CPython 3.14 / macOS arm64). `create_future` ties,
-  because all three loops reuse CPython's C-accelerated `_asyncio.Future`.
+- **Fast.** The hot paths - scheduling, timers, and socket I/O - run in Zig, not
+  Python. See [Performance](#performance) for benchmarks against asyncio and
+  uvloop, including an opt-in io_uring backend for free-threaded CPython.
 
 ## Performance
 
