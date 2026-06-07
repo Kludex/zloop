@@ -93,10 +93,14 @@ pub const Completor = struct {
     /// the ring and leave bufs.ring dangling (a recv would then hang on a stale
     /// ring), so the caller must give us our final location.
     pub fn init(self: *Completor, allocator: std.mem.Allocator) !void {
-        // Plain ring. (SINGLE_ISSUER/DEFER_TASKRUN would fit a single-threaded
-        // loop, but DEFER_TASKRUN defers completion processing to GETEVENTS-only
-        // and complicates the reap path; revisit as a perf tweak once correct.)
-        self.ring = IoUring.init(QUEUE_DEPTH, 0) catch return error.CompletorInitFailed;
+        // One thread owns each ring (one loop per thread), so SINGLE_ISSUER holds.
+        // DEFER_TASKRUN then defers completion processing to our submit_and_wait
+        // (reap always calls it), cutting the cross-thread kernel task-work that
+        // otherwise scales with the number of parallel loops. Both need a recent
+        // kernel; fall back to a plain ring if init rejects the flags.
+        const flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN;
+        self.ring = IoUring.init(QUEUE_DEPTH, flags) catch
+            IoUring.init(QUEUE_DEPTH, 0) catch return error.CompletorInitFailed;
         errdefer self.ring.deinit();
         self.allocator = allocator;
         // Provided-buffer ring (needs kernel 5.19+) built against our OWN ring.
