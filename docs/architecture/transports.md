@@ -81,6 +81,15 @@ There's matching flow control on the read side: `pause_reading()` removes the fd
 from the reactor (so no more `data_received`), and `resume_reading()` puts it
 back.
 
+!!! note "On the completion backend"
+    The reading/writing described here is the **readiness** path (the default).
+    With the opt-in io_uring [completion backend](completion.md), reads come from a
+    kernel-filled buffer (multishot recv, no per-message `recv`) and writes are
+    submitted as `SEND` on the ring rather than a synchronous `write()`. The
+    transport interface and flow-control contract above are identical either way;
+    only the mechanics underneath differ. Buffered/SSL protocols stay on the
+    readiness path even when io_uring is enabled.
+
 ### The full transport interface
 
 The transport implements everything asyncio (and uvicorn) expects:
