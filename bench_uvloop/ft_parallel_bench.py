@@ -1,9 +1,8 @@
-"""Throwaway free-threaded parallel-loops benchmark: N zloop loops on N threads,
-aggregate echo throughput, epoll vs io_uring. Requires GIL actually off.
-
-WARNING: zloop's free-threading races are NOT fixed yet; this runs under
-PYTHON_GIL=0 on racy code. Numbers are an indicative signal only and the process
-may crash or produce corrupt results.
+"""Free-threaded parallel-loops benchmark: N zloop loops on N threads, aggregate
+echo throughput, epoll vs io_uring. Requires the GIL actually off (run on a
+free-threaded build, e.g. python3.14t). Each loop is isolated to its own thread,
+so this measures how the io_uring backend scales once the GIL stops serializing
+the loops.
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ def run_loop_workload(n_conns: int, msg: int, dur: float, out: list, idx: int) -
     runner = asyncio.Runner(loop_factory=zloop.new_event_loop)
     try:
         out[idx] = runner.run(main())
-    except Exception as e:  # racy code; record instead of killing the whole run
+    except Exception as e:  # record per-thread failures instead of killing the run
         out[idx] = f"ERR:{type(e).__name__}:{e}"
     finally:
         runner.close()
@@ -91,7 +90,7 @@ def main() -> int:
     total = sum(oks)
     print(f"  per-thread roundtrips: {out}")
     if errs:
-        print(f"  ERRORS in {len(errs)}/{n_threads} threads (racy code): {errs[:2]}")
+        print(f"  ERRORS in {len(errs)}/{n_threads} threads: {errs[:2]}")
     print(f"  aggregate: {total} roundtrips in {elapsed:.2f}s => {total/elapsed:,.0f} req/s")
     return 0
 
