@@ -19,11 +19,27 @@ const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const sys = @import("sys.zig");
 
-/// True when ZLOOP_IO_URING=completion. Uses libc getenv (the module links libc).
-pub fn enabled() bool {
-    const raw = c.getenv("ZLOOP_IO_URING") orelse return false;
+/// Recv strategy for the completion backend.
+/// - ring: multishot recv from a provided-buffer ring (default; wins on small
+///   messages and free-threaded parallel loops, one copy out of the ring).
+/// - owned: single-shot recv straight into a caller-owned PyBytes (one copy, like
+///   the readiness path), avoiding the ring's copy-out for large messages.
+pub const RecvMode = enum { ring, owned };
+
+/// Which completion mode the env requests, or null when the completion backend is
+/// off. ZLOOP_IO_URING=completion -> ring; ZLOOP_IO_URING=owned -> owned. Uses
+/// libc getenv (the module links libc).
+pub fn mode() ?RecvMode {
+    const raw = c.getenv("ZLOOP_IO_URING") orelse return null;
     const v = std.mem.sliceTo(raw, 0);
-    return std.mem.eql(u8, v, "completion");
+    if (std.mem.eql(u8, v, "completion")) return .ring;
+    if (std.mem.eql(u8, v, "owned")) return .owned;
+    return null;
+}
+
+/// True when the completion backend is enabled in either recv mode.
+pub fn enabled() bool {
+    return mode() != null;
 }
 
 /// What kind of op a Completion is for. Encoded in the high bits of user_data so
@@ -139,6 +155,17 @@ pub const Completor = struct {
         sqe.user_data = ud;
     }
 
+    /// Queue a single-shot recv straight into the caller's `buf` (owned-buffer
+    /// mode): the kernel writes directly into the destination, so there is no
+    /// copy out of a ring buffer. The caller MUST keep `buf` alive and unmodified
+    /// until the matching completion. Single-shot - the caller re-submits with a
+    /// fresh buffer after each completion.
+    pub fn submitRecvInto(self: *Completor, fd: sys.fd_t, buf: []u8, ud: u64) !void {
+        const sqe = try self.ensureSqe();
+        sqe.prep_recv(fd, buf, 0);
+        sqe.user_data = ud;
+    }
+
     /// Queue a multishot POLL_ADD for readiness (accept/connect/signals - fds
     /// that aren't plain-socket data). Re-arms until F_MORE clears.
     pub fn submitPoll(self: *Completor, fd: sys.fd_t, want_read: bool, want_write: bool, ud: u64) !void {
@@ -227,8 +254,10 @@ pub const Completor = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const builtin = @import("builtin");
 
 test "completor: buffer-ring recv delivers kernel-filled bytes" {
+    if (comptime builtin.os.tag != .linux) return;
     var co: Completor = undefined;
     co.init(testing.allocator) catch return; // skip on old kernels
     defer co.deinit();
@@ -253,6 +282,7 @@ test "completor: buffer-ring recv delivers kernel-filled bytes" {
 }
 
 test "completor: send completes with the byte count" {
+    if (comptime builtin.os.tag != .linux) return;
     var co: Completor = undefined;
     co.init(testing.allocator) catch return;
     defer co.deinit();

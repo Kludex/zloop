@@ -54,6 +54,13 @@ const State = struct {
     send_buf: std.ArrayList(u8) = .empty,
     send_inflight: bool = false,
 
+    /// Completion-backend owned-recv state. In owned mode (ZLOOP_IO_URING=owned)
+    /// the kernel recv's straight into this pinned, uninitialised PyBytes - one
+    /// copy, like the readiness path, instead of a copy out of the ring. Held
+    /// (kernel-borrowed) until the recv completes; must not be freed while a recv
+    /// is in flight. null when not using owned recv. Owned.
+    recv_buf: py.Object = null,
+
     reading: bool = true,
     /// Set once the peer half-closed and eof_received() asked to keep the
     /// connection open; resume_reading must not re-arm the reader after this.
@@ -236,6 +243,7 @@ fn destroyState(st: *State) void {
     py.xdecref(st.sock_obj);
     py.xdecref(st.context);
     py.xdecref(st.loop_obj);
+    py.xdecref(st.recv_buf);
     st.write_buf.deinit(gpa);
     st.send_buf.deinit(gpa);
     gpa.destroy(st);
@@ -423,13 +431,36 @@ fn usesCompletion(st: *State) bool {
     return st.engine.isCompletion() and !st.buffered;
 }
 
+fn usesOwnedRecv(st: *State) bool {
+    return usesCompletion(st) and st.engine.isOwnedRecv();
+}
+
+/// Allocate a fresh pinned PyBytes and submit a single-shot owned recv into it.
+/// Frees any prior buffer first (only safe once the previous recv has completed
+/// or been cancelled). Returns error.NoBufferSpace if allocation fails.
+fn armOwnedRecv(st: *State) !void {
+    py.clear(&st.recv_buf);
+    const data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
+    if (data == null) {
+        py.c.PyErr_Clear();
+        return error.NoBufferSpace;
+    }
+    st.recv_buf = data;
+    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
+    st.engine.submitRecvInto(st.fd, dst[0..READ_CHUNK]);
+}
+
 fn startReading(st: *State) !void {
     if (usesCompletion(st)) {
         // The completion callback lives for the transport's whole lifetime (sends
         // route to it too, even while reading is paused); recv activation is
         // separate. registerCompletion is idempotent, so resume_reading is fine.
         try st.engine.registerCompletion(st.fd, .{ .func = ioCompleted, .ctx = st });
-        try st.engine.startRecv(st.fd);
+        if (usesOwnedRecv(st)) {
+            try armOwnedRecv(st);
+        } else {
+            try st.engine.startRecv(st.fd);
+        }
     } else {
         try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
     }
@@ -456,10 +487,12 @@ fn ioCompleted(ctx: *anyopaque, res: core.IoResult) void {
     if (res.kind == .send) sendCompleted(st, res) else readCompleted(st, res);
 }
 
-/// Recv branch: the kernel already recv'd into `res.buf`. Build a PyBytes (GIL
-/// held) and deliver data_received. The recv is multishot - the kernel keeps it
-/// armed and the loop re-arms when F_MORE drops - so this never re-submits.
-/// res.bytes==0 is a clean EOF; <0 is -errno.
+/// Recv branch. res.bytes==0 is a clean EOF; <0 is -errno; >0 delivers data.
+/// Ring mode: the kernel filled a ring buffer exposed as `res.buf`; copy it into
+/// a PyBytes (multishot - the loop re-arms). Owned mode: the kernel filled our
+/// pinned `recv_buf` directly; resize it to res.bytes, deliver, and re-arm with a
+/// fresh buffer (single-shot, so we always resubmit while reading so a trailing
+/// FIN is observed).
 fn readCompleted(st: *State, res: core.IoResult) void {
     if (st.conn_lost or !st.reading) return;
     if (res.bytes == 0) {
@@ -468,6 +501,10 @@ fn readCompleted(st: *State, res: core.IoResult) void {
     }
     if (res.bytes < 0) {
         fatalError(st, error.RecvFailed);
+        return;
+    }
+    if (usesOwnedRecv(st)) {
+        ownedRecvCompleted(st, @intCast(res.bytes));
         return;
     }
     const data = py.c.PyBytes_FromStringAndSize(res.buf.ptr, @intCast(res.buf.len));
@@ -482,6 +519,32 @@ fn readCompleted(st: *State, res: core.IoResult) void {
         }
         py.decref(r);
     }
+}
+
+/// Owned-mode recv completion: the kernel wrote `n` bytes into the pinned
+/// `recv_buf`. Take it (it's no longer in flight), shrink to `n`, deliver, then
+/// re-arm a fresh buffer.
+fn ownedRecvCompleted(st: *State, n: usize) void {
+    var data = st.recv_buf;
+    st.recv_buf = null; // the recv is done; this PyBytes is ours to deliver
+    if (data == null) return; // shouldn't happen; nothing in flight
+    if (n != READ_CHUNK) {
+        if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+            py.c.PyErr_Clear(); // _PyBytes_Resize released `data` on failure
+            return;
+        }
+    }
+    const r = callDataReceived(st, data);
+    py.decref(data);
+    if (r == null) {
+        reportProtocolError(st, "data_received");
+        return;
+    }
+    py.decref(r);
+    // Single-shot: re-arm for the next message if still reading. Resubmitting
+    // after every positive recv is also how a trailing FIN gets observed (the
+    // next recv returns 0).
+    if (st.reading and !st.conn_lost) armOwnedRecv(st) catch fatalError(st, error.NoBufferSpace);
 }
 
 fn handleEof(st: *State) void {

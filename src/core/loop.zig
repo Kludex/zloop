@@ -143,8 +143,12 @@ pub const Loop = struct {
     dispatcher: Dispatcher,
 
     /// Completion backend (io_uring), used instead of `reactor` when
-    /// ZLOOP_IO_URING=completion and the kernel supports it. null = readiness.
+    /// ZLOOP_IO_URING is set and the kernel supports it. null = readiness.
     completor: ?CompletorT = null,
+    /// Recv strategy when the completion backend is on: ring (multishot provided
+    /// buffers) or owned (single-shot recv into a caller PyBytes). Set once at
+    /// setup; a connection never switches mid-stream.
+    recv_mode: completion.RecvMode = .ring,
     /// Per-fd completion callbacks (the completion analogue of `fds`).
     comp_fds: std.AutoHashMap(sys.fd_t, CompletionCallback),
     /// Per-fd, per-op-family generations, bumped each (re)submission so a late
@@ -198,21 +202,23 @@ pub const Loop = struct {
         };
     }
 
-    /// Enable the io_uring completion backend if ZLOOP_IO_URING=completion and the
+    /// Enable the io_uring completion backend if ZLOOP_IO_URING is set and the
     /// kernel supports it. MUST be called after the Loop is at its final address
     /// (the Completor is self-referential), i.e. by the owner right after init().
     /// No-op (stays on readiness) when disabled or unsupported.
     pub fn setupCompletion(self: *Loop) void {
-        if (!has_completion or !completion.enabled()) return;
-        _ = self.enableCompletion();
+        if (!has_completion) return;
+        const m = completion.mode() orelse return;
+        _ = self.enableCompletion(m);
     }
 
-    /// Build the completion backend regardless of the env gate. Returns false
-    /// (staying on readiness) when already enabled or the kernel lacks io_uring /
-    /// provided-buffer rings. Tests call this directly; setupCompletion gates it
-    /// on ZLOOP_IO_URING=completion.
-    fn enableCompletion(self: *Loop) bool {
+    /// Build the completion backend regardless of the env gate, in recv mode `m`.
+    /// Returns false (staying on readiness) when already enabled or the kernel
+    /// lacks io_uring / provided-buffer rings. Tests call this directly;
+    /// setupCompletion gates it on ZLOOP_IO_URING.
+    fn enableCompletion(self: *Loop, m: completion.RecvMode) bool {
         if (!has_completion or self.completor != null) return false;
+        self.recv_mode = m;
         // Init in place: the Completor is self-referential (bufs.ring points at
         // its own ring), so it must be built directly in its final storage.
         self.completor = @as(CompletorT, undefined);
@@ -231,6 +237,11 @@ pub const Loop = struct {
     /// True when this loop is using the io_uring completion backend.
     pub fn isCompletion(self: *const Loop) bool {
         return self.completor != null;
+    }
+
+    /// True when the completion backend recv's into caller-owned buffers (no ring).
+    pub fn isOwnedRecv(self: *const Loop) bool {
+        return self.completor != null and self.recv_mode == .owned;
     }
 
     // -- per-fd completion generation helpers ---------------------------------
@@ -621,11 +632,13 @@ pub const Loop = struct {
         const cb = self.comp_fds.get(fd) orelse return; // gone fd
         cb.fire(.{ .kind = kind, .bytes = comp.result, .buf = comp.buf });
 
-        // Multishot recv: the kernel keeps it armed (F_MORE) and posts a CQE per
-        // arrival, so the transport never re-arms per message. Only resubmit when
-        // the kernel dropped F_MORE on a still-live read stream (e.g. the buffer
-        // ring momentarily ran dry) - and only if the fd is still being read.
-        if (kind == .recv and comp.result > 0 and comp.flags & completion.F_MORE == 0) {
+        // Ring multishot recv: the kernel keeps it armed (F_MORE) and posts a CQE
+        // per arrival, so the transport never re-arms per message. Only resubmit
+        // when the kernel dropped F_MORE on a still-live read stream (e.g. the
+        // buffer ring momentarily ran dry) - and only if the fd is still read.
+        // Owned-mode recvs are single-shot; the transport re-arms them (it must
+        // allocate a fresh buffer), so the loop does not auto-rearm there.
+        if (self.recv_mode == .ring and kind == .recv and comp.result > 0 and comp.flags & completion.F_MORE == 0) {
             if (self.comp_fds.get(fd)) |live| {
                 self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, live.gen)) catch {};
             }
@@ -646,6 +659,15 @@ pub const Loop = struct {
         if (!has_completion) return;
         const g = self.compGen(fd).recv;
         try self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g));
+    }
+
+    /// Owned-mode recv: submit a single-shot recv into the caller-owned `buf`
+    /// (kept alive by the caller until the completion). The callback must already
+    /// be registered; the caller re-submits a fresh buffer after each completion.
+    pub fn submitRecvInto(self: *Loop, fd: sys.fd_t, buf: []u8) void {
+        if (!has_completion) return;
+        const g = self.compGen(fd).recv;
+        self.completor.?.submitRecvInto(fd, buf, completion.UserData.make(.recv, fd, g)) catch {};
     }
 
     /// Cancel the outstanding recv without dropping the callback or stranding an
@@ -835,7 +857,7 @@ test "completion: write interest does not drop a pending recv" {
     var loop = try Loop.init(testing.allocator, td.dispatcher());
     defer loop.deinit();
 
-    if (!loop.enableCompletion()) return; // old kernel -> skip
+    if (!loop.enableCompletion(.ring)) return; // old kernel -> skip
 
     const fds = try sys.socketPair();
     defer sys.close(fds[0]);
@@ -875,7 +897,7 @@ test "completion: submitSend delivers bytes and reports a send completion" {
     var loop = try Loop.init(testing.allocator, td.dispatcher());
     defer loop.deinit();
 
-    if (!loop.enableCompletion()) return; // old kernel -> skip
+    if (!loop.enableCompletion(.ring)) return; // old kernel -> skip
 
     const fds = try sys.socketPair();
     defer sys.close(fds[0]);
@@ -896,6 +918,40 @@ test "completion: submitSend delivers bytes and reports a send completion" {
     var buf: [32]u8 = undefined;
     const n = try sys.read(fds[1], &buf);
     try testing.expectEqualStrings(payload, buf[0..n]);
+
+    loop.stopIo(fds[0]);
+}
+
+// Owned-buffer recv mode: the kernel writes directly into the caller's buffer
+// (no provided-buffer ring), and the byte count comes back on the completion.
+// (Linux io_uring only; skipped when the kernel lacks io_uring.)
+test "completion: owned recv writes into the caller buffer" {
+    if (!has_completion) return;
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    if (!loop.enableCompletion(.owned)) return; // old kernel -> skip
+    try testing.expect(loop.isOwnedRecv());
+
+    const fds = try sys.socketPair();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    _ = try sys.write(fds[1], "owned-data");
+
+    var rec = RecvRecorder{};
+    try loop.registerCompletion(fds[0], rec.callback());
+    var dst: [64]u8 = undefined;
+    loop.submitRecvInto(fds[0], &dst);
+
+    var iters: usize = 0;
+    while (rec.bytes == -2 and iters < 20) : (iters += 1) {
+        try loop.runOnce(20 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(isize, 10), rec.bytes);
+    try testing.expectEqualStrings("owned-data", dst[0..10]);
 
     loop.stopIo(fds[0]);
 }
