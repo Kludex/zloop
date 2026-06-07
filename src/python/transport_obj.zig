@@ -42,6 +42,13 @@ const State = struct {
     high_water: usize = DEFAULT_HIGH_WATER,
     low_water: usize = DEFAULT_HIGH_WATER / 4,
 
+    /// Completion-backend send state. An io_uring SEND borrows its buffer until
+    /// the CQE, so the in-flight bytes live in `send_buf` (stable, not mutated
+    /// while a send is outstanding); newly written bytes accumulate in `write_buf`
+    /// and are promoted to `send_buf` once the in-flight send completes.
+    send_buf: std.ArrayList(u8) = .empty,
+    send_inflight: bool = false,
+
     reading: bool = true,
     /// Set once the peer half-closed and eof_received() asked to keep the
     /// connection open; resume_reading must not re-arm the reader after this.
@@ -198,6 +205,7 @@ fn destroyState(st: *State) void {
     py.xdecref(st.context);
     py.xdecref(st.loop_obj);
     st.write_buf.deinit(gpa);
+    st.send_buf.deinit(gpa);
     gpa.destroy(st);
 }
 
@@ -370,30 +378,42 @@ fn usesCompletion(st: *State) bool {
 
 fn startReading(st: *State) !void {
     if (usesCompletion(st)) {
-        try st.engine.startRecv(st.fd, .{ .func = readCompleted, .ctx = st });
+        // The completion callback lives for the transport's whole lifetime (sends
+        // route to it too, even while reading is paused); recv activation is
+        // separate. registerCompletion is idempotent, so resume_reading is fine.
+        try st.engine.registerCompletion(st.fd, .{ .func = ioCompleted, .ctx = st });
+        try st.engine.startRecv(st.fd);
     } else {
         try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
     }
     st.reading = true;
 }
 
-/// Stop reading on whichever backend this connection uses.
+/// Stop reading on whichever backend this connection uses. On completion this
+/// cancels the recv but keeps the callback registered so in-flight/queued sends
+/// still complete; full teardown happens via stopIo in doConnectionLost/dealloc.
 fn stopReading(st: *State) void {
     if (usesCompletion(st)) {
-        st.engine.stopIo(st.fd);
+        st.engine.stopRecv(st.fd);
     } else {
         _ = st.engine.removeReader(st.fd);
     }
     st.reading = false;
 }
 
-/// Completion-backend read callback: the kernel already recv'd into `res.buf`.
-/// Build a PyBytes from it (the GIL is held here) and deliver data_received. The
-/// recv is multishot - the kernel keeps it armed and the loop handles any re-arm
-/// when F_MORE drops - so this never re-submits. res.bytes==0 is a clean EOF;
-/// <0 is -errno.
-fn readCompleted(ctx: *anyopaque, res: core.IoResult) void {
+/// Completion-backend I/O callback. The loop routes both recv and send CQEs for
+/// this fd here; dispatch by op kind. (Sends must be handled even after
+/// pause_reading, so the recv-only `reading` guard lives in readCompleted.)
+fn ioCompleted(ctx: *anyopaque, res: core.IoResult) void {
     const st: *State = @ptrCast(@alignCast(ctx));
+    if (res.kind == .send) sendCompleted(st, res) else readCompleted(st, res);
+}
+
+/// Recv branch: the kernel already recv'd into `res.buf`. Build a PyBytes (GIL
+/// held) and deliver data_received. The recv is multishot - the kernel keeps it
+/// armed and the loop re-arms when F_MORE drops - so this never re-submits.
+/// res.bytes==0 is a clean EOF; <0 is -errno.
+fn readCompleted(st: *State, res: core.IoResult) void {
     if (st.conn_lost or !st.reading) return;
     if (res.bytes == 0) {
         handleEof(st);
@@ -445,9 +465,19 @@ fn handleEof(st: *State) void {
 // writing
 // ---------------------------------------------------------------------------
 
+/// Bytes still owed to the peer: queued plus any in-flight send (completion path).
+fn pendingWrite(st: *State) usize {
+    return st.write_buf.items.len + st.send_buf.items.len;
+}
+
 fn writeBytes(st: *State, data: []const u8) void {
     if (st.conn_lost or st.eof_sent) return;
     if (data.len == 0) return;
+
+    if (usesCompletion(st)) {
+        writeBytesCompletion(st, data);
+        return;
+    }
 
     var consumed: usize = 0;
     // Fast path: nothing buffered, try to send immediately.
@@ -468,6 +498,60 @@ fn writeBytes(st: *State, data: []const u8) void {
     };
     maybeRegisterWrite(st);
     maybePauseProtocol(st);
+}
+
+/// Completion-backend write: an io_uring SEND borrows its buffer until the CQE,
+/// so new bytes queue in `write_buf` and a single send is kept in flight from the
+/// stable `send_buf`. No sync write() - the send batches into the loop's enter.
+fn writeBytesCompletion(st: *State, data: []const u8) void {
+    st.write_buf.appendSlice(gpa, data) catch {
+        fatalError(st, error.NoBufferSpace);
+        return;
+    };
+    kickSend(st);
+    maybePauseProtocol(st);
+}
+
+/// Promote queued bytes into the in-flight send buffer and submit a SEND, unless
+/// one is already outstanding (one send in flight per fd).
+fn kickSend(st: *State) void {
+    if (st.send_inflight or st.write_buf.items.len == 0 or st.conn_lost) return;
+    std.mem.swap(std.ArrayList(u8), &st.send_buf, &st.write_buf);
+    st.write_buf.clearRetainingCapacity();
+    st.send_inflight = true;
+    st.engine.submitSend(st.fd, st.send_buf.items);
+}
+
+/// Completion-backend send callback: `res.bytes` were sent from `send_buf`. Drop
+/// them; resubmit the remainder on a partial send; otherwise promote any bytes
+/// queued meanwhile, and finish close/eof once fully drained.
+fn sendCompleted(st: *State, res: core.IoResult) void {
+    if (st.conn_lost) return;
+    st.send_inflight = false;
+    if (res.bytes < 0) {
+        fatalError(st, error.SendFailed);
+        return;
+    }
+    const sent: usize = @intCast(res.bytes);
+    const remaining = st.send_buf.items.len - sent;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, st.send_buf.items[0..remaining], st.send_buf.items[sent..]);
+    }
+    st.send_buf.shrinkRetainingCapacity(remaining);
+
+    if (st.send_buf.items.len > 0) { // partial send: resubmit the rest
+        st.send_inflight = true;
+        st.engine.submitSend(st.fd, st.send_buf.items);
+        return;
+    }
+
+    kickSend(st); // anything queued while this send was in flight
+    maybeResumeProtocol(st);
+
+    if (pendingWrite(st) == 0 and !st.send_inflight) {
+        if (st.eof_sent) sys.shutdown(st.fd, 1); // SHUT_WR after flush
+        if (st.closing) closeTransport(st, null);
+    }
 }
 
 fn maybeRegisterWrite(st: *State) void {
@@ -517,14 +601,14 @@ fn stopWriting(st: *State) void {
 // -- flow control ------------------------------------------------------------
 
 fn maybePauseProtocol(st: *State) void {
-    if (!st.writing_paused and st.write_buf.items.len > st.high_water) {
+    if (!st.writing_paused and pendingWrite(st) > st.high_water) {
         st.writing_paused = true;
         callProtocol(st, "pause_writing");
     }
 }
 
 fn maybeResumeProtocol(st: *State) void {
-    if (st.writing_paused and st.write_buf.items.len <= st.low_water) {
+    if (st.writing_paused and pendingWrite(st) <= st.low_water) {
         st.writing_paused = false;
         callProtocol(st, "resume_writing");
     }
@@ -548,8 +632,9 @@ fn callProtocol(st: *State, name: [*c]const u8) void {
 fn closeTransport(st: *State, exc: py.Object) void {
     if (st.conn_lost) return;
     st.closing = true;
-    if (st.write_buf.items.len > 0 and exc == null) {
-        // defer real close until the buffer flushes (handled in writeCallback)
+    // Defer the real close until queued + in-flight bytes flush (the readiness
+    // writeCallback or the completion sendCompleted finishes the close).
+    if ((pendingWrite(st) > 0 or st.send_inflight) and exc == null) {
         return;
     }
     doConnectionLost(st, exc);
@@ -577,6 +662,7 @@ fn doConnectionLost(st: *State, exc: py.Object) void {
     if (st.reading) {
         stopReading(st);
     }
+    if (usesCompletion(st)) st.engine.stopIo(st.fd); // drop callback + cancel send/recv
     closeFd(st);
 
     scheduleConnectionLost(st, exc);
@@ -670,6 +756,7 @@ fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
         if (!st.conn_lost) {
             if (st.reading) stopReading(st);
             stopWriting(st);
+            if (usesCompletion(st)) st.engine.stopIo(st.fd);
             closeFd(st);
         }
         destroyState(st);
@@ -703,6 +790,7 @@ fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
         if (!st.conn_lost) {
             if (st.reading) stopReading(st);
             stopWriting(st);
+            if (usesCompletion(st)) st.engine.stopIo(st.fd);
             closeFd(st);
             st.conn_lost = true;
         }
@@ -805,7 +893,9 @@ fn t_write_eof(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (st.eof_sent or st.conn_lost) return py.none();
     st.eof_sent = true;
-    if (st.write_buf.items.len == 0) sys.shutdown(st.fd, 1); // SHUT_WR
+    // SHUT_WR now if nothing is pending; otherwise the flush path (writeCallback
+    // or sendCompleted) shuts down once queued + in-flight bytes drain.
+    if (pendingWrite(st) == 0 and !st.send_inflight) sys.shutdown(st.fd, 1);
     return py.none();
 }
 

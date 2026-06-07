@@ -122,10 +122,15 @@ const CompletorT = if (has_completion) completion.Completor else void;
 /// generation and make its completion look stale, silently dropping the data.
 const CompGen = struct {
     recv: u32 = 0,
+    send: u32 = 0,
     poll: u32 = 0,
 
     fn of(self: CompGen, kind: completion.OpKind) u32 {
-        return if (kind == .poll) self.poll else self.recv;
+        return switch (kind) {
+            .poll => self.poll,
+            .send => self.send,
+            else => self.recv,
+        };
     }
 };
 
@@ -234,15 +239,16 @@ pub const Loop = struct {
         return self.comp_gen.get(fd) orelse .{};
     }
 
-    /// Bump the generation for `kind` (recv or poll) on `fd` and return the new
-    /// value. The other family's generation is preserved, so a write-interest
-    /// re-arm cannot invalidate an in-flight recv (and vice versa).
+    /// Bump the generation for `kind` (recv, send, or poll) on `fd` and return the
+    /// new value. The other families' generations are preserved, so e.g. a
+    /// write-interest re-arm cannot invalidate an in-flight recv, and pausing a
+    /// reader cannot strand an in-flight send.
     fn bumpGen(self: *Loop, fd: sys.fd_t, kind: completion.OpKind) u32 {
         var g = self.compGen(fd);
-        if (kind == .poll) {
-            g.poll +%= 1;
-        } else {
-            g.recv +%= 1;
+        switch (kind) {
+            .poll => g.poll +%= 1,
+            .send => g.send +%= 1,
+            else => g.recv +%= 1,
         }
         self.comp_gen.put(fd, g) catch {};
         return g.of(kind);
@@ -626,36 +632,54 @@ pub const Loop = struct {
         }
     }
 
-    /// Register `cb` as the completion handler for `fd` and submit a recv. The
-    /// transport calls this instead of addReader on the completion backend.
-    pub fn startRecv(self: *Loop, fd: sys.fd_t, cb: CompletionCallback) !void {
+    /// Register `cb` as the completion handler for `fd` for its whole lifetime on
+    /// the completion backend. Recv and send CQEs for the fd route to it; recv
+    /// activation is separate (startRecv/stopRecv) so a paused reader can still
+    /// write. Idempotent re-register just refreshes the callback.
+    pub fn registerCompletion(self: *Loop, fd: sys.fd_t, cb: CompletionCallback) !void {
         if (!has_completion) return;
-        const g = self.bumpGen(fd, .recv);
-        var entry = cb;
-        entry.gen = g;
-        try self.comp_fds.put(fd, entry);
+        try self.comp_fds.put(fd, cb);
+    }
+
+    /// Submit a (multishot) recv for `fd`. The callback must already be registered.
+    pub fn startRecv(self: *Loop, fd: sys.fd_t) !void {
+        if (!has_completion) return;
+        const g = self.compGen(fd).recv;
         try self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g));
     }
 
-    /// Submit a send of `buf` (kernel-borrowed until completion; caller pins it).
-    /// Sends share the recv (data) generation family.
-    pub fn submitSend(self: *Loop, fd: sys.fd_t, buf: []const u8) void {
+    /// Cancel the outstanding recv without dropping the callback or stranding an
+    /// in-flight send: bump only the recv generation so late recv CQEs are
+    /// dropped, but sends (tagged with the send generation) keep routing.
+    pub fn stopRecv(self: *Loop, fd: sys.fd_t) void {
         if (!has_completion) return;
         const g = self.compGen(fd).recv;
+        self.completor.?.cancel(completion.UserData.make(.recv, fd, g), completion.WAKE_UD);
+        _ = self.bumpGen(fd, .recv);
+    }
+
+    /// Submit a send of `buf` (kernel-borrowed until completion; caller pins it).
+    /// Sends carry their own generation so pausing/resuming reads never strands a
+    /// send, and an unregister drops a late send CQE.
+    pub fn submitSend(self: *Loop, fd: sys.fd_t, buf: []const u8) void {
+        if (!has_completion) return;
+        const g = self.compGen(fd).send;
         self.completor.?.submitSend(fd, buf, completion.UserData.make(.send, fd, g)) catch {};
     }
 
-    /// Cancel outstanding recv/send for `fd` and drop its completion handler. The
-    /// cancellations complete as -ECANCELED and are ignored (recv gen bumped).
+    /// Drop the completion handler for `fd` and cancel any outstanding recv/send.
+    /// Bumps recv and send generations so late CQEs are ignored.
     pub fn stopIo(self: *Loop, fd: sys.fd_t) void {
         if (!has_completion) return;
         if (self.comp_fds.fetchRemove(fd)) |kv| {
             kv.value.dispose_();
-            const g = self.compGen(fd).recv;
-            self.completor.?.cancel(completion.UserData.make(.recv, fd, g), completion.WAKE_UD);
-            // Bump the recv generation so any late recv/send CQE is dropped, then
+            const g = self.compGen(fd);
+            self.completor.?.cancel(completion.UserData.make(.recv, fd, g.recv), completion.WAKE_UD);
+            self.completor.?.cancel(completion.UserData.make(.send, fd, g.send), completion.WAKE_UD);
+            // Bump both data generations so any late recv/send CQE is dropped, then
             // drop the gen entry if no readiness watch remains on this fd.
             _ = self.bumpGen(fd, .recv);
+            _ = self.bumpGen(fd, .send);
             self.gcGen(fd);
         }
     }
@@ -818,7 +842,8 @@ test "completion: write interest does not drop a pending recv" {
     defer sys.close(fds[1]);
 
     var rec = RecvRecorder{};
-    try loop.startRecv(fds[0], rec.callback());
+    try loop.registerCompletion(fds[0], rec.callback());
+    try loop.startRecv(fds[0]);
 
     // Register write interest on the SAME fd: this submits a POLL_ADD and, with
     // the bug, would bump the (shared) generation and strand the recv above.
@@ -838,4 +863,39 @@ test "completion: write interest does not drop a pending recv" {
 
     loop.stopIo(fds[0]);
     _ = loop.removeWriter(fds[0]);
+}
+
+// Completion-path write: submitSend delivers the bytes and posts a send CQE that
+// routes to the fd's registered callback. Verifies sends work even with reading
+// active (shared callback, separate send generation). (Linux io_uring only.)
+test "completion: submitSend delivers bytes and reports a send completion" {
+    if (!has_completion) return;
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    if (!loop.enableCompletion()) return; // old kernel -> skip
+
+    const fds = try sys.socketPair();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    var rec = RecvRecorder{};
+    try loop.registerCompletion(fds[0], rec.callback());
+
+    const payload = "hello-send";
+    loop.submitSend(fds[0], payload);
+
+    var iters: usize = 0;
+    while (rec.bytes == -2 and iters < 20) : (iters += 1) {
+        try loop.runOnce(20 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(isize, @intCast(payload.len)), rec.bytes);
+
+    var buf: [32]u8 = undefined;
+    const n = try sys.read(fds[1], &buf);
+    try testing.expectEqualStrings(payload, buf[0..n]);
+
+    loop.stopIo(fds[0]);
 }
