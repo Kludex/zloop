@@ -33,9 +33,9 @@ The key features are:
   server/client workloads - TCP, TLS, Unix sockets, the streams and transport
   APIs - your code runs unchanged. (A few rarely-used loop APIs aren't
   implemented yet; see [Compatibility](reference/compatibility.md).)
-* **Fast**: on the benchmarks we've run so far, faster than uvloop at scheduling,
-  timers, and small/medium-message socket throughput. See
-  [Performance](reference/performance.md).
+* **Fast**: the hot paths - scheduling, timers, and socket I/O - run in Zig, not
+  Python. See [Performance](reference/performance.md) for benchmarks against
+  asyncio and uvloop.
 * **Familiar**: works the same way uvloop does, so the tools you already know
   ([uvicorn](usage/servers.md), [AnyIO](usage/asyncio.md#with-anyio),
   [FastAPI](usage/servers.md#fastapi-starlette)) just pick it up.
