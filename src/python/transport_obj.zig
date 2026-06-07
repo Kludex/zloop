@@ -32,6 +32,11 @@ const State = struct {
     loop_obj: py.Object, // owned - keeps the Loop (and its `engine`) alive
     engine: *core.Loop,
     protocol: py.Object, // owned
+    /// Bound protocol.data_received, cached at creation/set_protocol so the read
+    /// hot path skips a per-message attribute lookup (a typed dict/MRO walk that
+    /// takes per-object locks and contends across free-threaded loops). Owned;
+    /// null when the protocol has no data_received (rebuilt on set_protocol).
+    data_received: py.Object = null,
     self_obj: py.Object, // borrowed back-pointer for callbacks
     extra: py.Object, // dict of get_extra_info data (owned)
     /// The Python socket object that owns this fd, if any (owned). Closing it
@@ -41,6 +46,13 @@ const State = struct {
     write_buf: std.ArrayList(u8) = .empty,
     high_water: usize = DEFAULT_HIGH_WATER,
     low_water: usize = DEFAULT_HIGH_WATER / 4,
+
+    /// Completion-backend send state. An io_uring SEND borrows its buffer until
+    /// the CQE, so the in-flight bytes live in `send_buf` (stable, not mutated
+    /// while a send is outstanding); newly written bytes accumulate in `write_buf`
+    /// and are promoted to `send_buf` once the in-flight send completes.
+    send_buf: std.ArrayList(u8) = .empty,
+    send_inflight: bool = false,
 
     reading: bool = true,
     /// Set once the peer half-closed and eof_received() asked to keep the
@@ -73,6 +85,31 @@ fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
     const m = py.getAttr(st.protocol, method_name);
     if (m == null) return null;
     defer py.decref(m);
+    return callUnderContext(st, m, arg);
+}
+
+/// Like protoCall1 but with an already-resolved callable - used by the read hot
+/// path with the cached data_received to skip the per-message lookup. Holds a
+/// strong ref across the call: data_received may reentrantly set_protocol or
+/// close the transport, which clears the cache and could otherwise free the
+/// in-flight method out from under us.
+fn protoCallCached(st: *State, m: py.Object, arg: py.Object) py.Object {
+    py.incref(m);
+    defer py.decref(m);
+    return callUnderContext(st, m, arg);
+}
+
+/// Deliver `data` to protocol.data_received via the cached bound method (hot
+/// path), falling back to a lookup if the cache is empty. Returns a new ref or
+/// null with PyErr set.
+fn callDataReceived(st: *State, data: py.Object) py.Object {
+    if (st.data_received) |m| return protoCallCached(st, m, data);
+    return protoCall1(st, "data_received", data);
+}
+
+/// Invoke borrowed callable `m` with `arg` under the connection's captured
+/// context. Returns a new ref or null with PyErr set.
+fn callUnderContext(st: *State, m: py.Object, arg: py.Object) py.Object {
     if (st.context == null or py.isNone(st.context)) return py.callOneArg(m, arg);
     // Run under the connection's context via the raw C-API (no context.run
     // attribute lookup), preserving the callback's exception across the exit.
@@ -135,6 +172,7 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     // A BufferedProtocol (get_buffer/buffer_updated) takes the zero-copy read
     // path; SSLProtocol is one.
     st.buffered = py.hasAttr(protocol, "get_buffer");
+    cacheProtocolMethods(st);
     // Capture the current context so protocol callbacks (and the create_task
     // they make) inherit contextvars set by the caller.
     st.context = captureContext();
@@ -193,12 +231,29 @@ fn callLoopHook(st: *State, name: [*c]const u8) void {
 
 fn destroyState(st: *State) void {
     py.xdecref(st.protocol);
+    py.xdecref(st.data_received);
     py.xdecref(st.extra);
     py.xdecref(st.sock_obj);
     py.xdecref(st.context);
     py.xdecref(st.loop_obj);
     st.write_buf.deinit(gpa);
+    st.send_buf.deinit(gpa);
     gpa.destroy(st);
+}
+
+/// Cache the bound protocol methods used on the hot path so each message skips an
+/// attribute lookup. Re-run whenever the protocol changes (set_protocol). Clears
+/// any prior cache first. A missing data_received leaves the cache null and the
+/// read path falls back to a per-message lookup.
+fn cacheProtocolMethods(st: *State) void {
+    py.clear(&st.data_received);
+    if (st.protocol == null) return;
+    const m = py.getAttr(st.protocol, "data_received");
+    if (m == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    st.data_received = m; // owned
 }
 
 fn captureContext() py.Object {
@@ -307,50 +362,126 @@ fn deliverBuffered(st: *State) void {
 const READ_CHUNK = 256 * 1024;
 
 fn deliverData(st: *State) void {
-    var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
-    if (data == null) {
-        py.c.PyErr_Clear();
-        return;
-    }
-    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
-    const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
-        error.WouldBlock, error.Interrupted => {
-            py.decref(data);
-            return;
-        },
-        else => {
-            py.decref(data);
-            fatalError(st, err);
-            return;
-        },
-    };
-
-    if (n == 0) {
-        py.decref(data);
-        handleEof(st);
-        return;
-    }
-
-    // Shrink the bytes object to what we actually read.
-    if (n != READ_CHUNK) {
-        if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+    // Drain the socket per readiness notification. Level-triggered epoll re-fires
+    // while data/EOF remain, but io_uring's multishot poll is edge-triggered: a
+    // recv that doesn't reach EAGAIN/EOF may get no further notification (e.g.
+    // "data" then FIN arriving together). Reading until WouldBlock or EOF makes
+    // the read path correct on both backends. A short read (< READ_CHUNK) means
+    // the socket buffer is drained, so stop without a speculative extra recv.
+    while (true) {
+        if (st.conn_lost or !st.reading) return;
+        var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
+        if (data == null) {
             py.c.PyErr_Clear();
-            return; // _PyBytes_Resize already released `data` on failure
+            return;
         }
-    }
-    defer py.decref(data);
+        const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
+        const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted => {
+                py.decref(data);
+                return;
+            },
+            else => {
+                py.decref(data);
+                fatalError(st, err);
+                return;
+            },
+        };
 
-    const r = protoCall1(st, "data_received", data);
-    if (r == null) {
-        reportProtocolError(st, "data_received");
-    } else {
+        if (n == 0) {
+            py.decref(data);
+            handleEof(st);
+            return;
+        }
+
+        // Shrink the bytes object to what we actually read.
+        if (n != READ_CHUNK) {
+            if (py.c._PyBytes_Resize(&data, @intCast(n)) != 0) {
+                py.c.PyErr_Clear();
+                return; // _PyBytes_Resize already released `data` on failure
+            }
+        }
+
+        const r = callDataReceived(st, data);
+        py.decref(data);
+        if (r == null) {
+            reportProtocolError(st, "data_received");
+            return;
+        }
         py.decref(r);
+        // Loop until WouldBlock/EOF: under edge-triggered io_uring a pending FIN
+        // after a short read gets no further notification, so we must reach it
+        // here (the next recv returns 0). The extra EAGAIN recv is the cost of
+        // being backend-agnostic.
     }
 }
 
+/// Plain (non-buffered) connections use the completion backend when active;
+/// buffered/SSL connections stay on readiness because the kernel can't hold the
+/// protocol's get_buffer() buffer across the async gap.
+fn usesCompletion(st: *State) bool {
+    return st.engine.isCompletion() and !st.buffered;
+}
+
 fn startReading(st: *State) !void {
-    try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
+    if (usesCompletion(st)) {
+        // The completion callback lives for the transport's whole lifetime (sends
+        // route to it too, even while reading is paused); recv activation is
+        // separate. registerCompletion is idempotent, so resume_reading is fine.
+        try st.engine.registerCompletion(st.fd, .{ .func = ioCompleted, .ctx = st });
+        try st.engine.startRecv(st.fd);
+    } else {
+        try st.engine.addReader(st.fd, .{ .func = readCallback, .ctx = st });
+    }
     st.reading = true;
+}
+
+/// Stop reading on whichever backend this connection uses. On completion this
+/// cancels the recv but keeps the callback registered so in-flight/queued sends
+/// still complete; full teardown happens via stopIo in doConnectionLost/dealloc.
+fn stopReading(st: *State) void {
+    if (usesCompletion(st)) {
+        st.engine.stopRecv(st.fd);
+    } else {
+        _ = st.engine.removeReader(st.fd);
+    }
+    st.reading = false;
+}
+
+/// Completion-backend I/O callback. The loop routes both recv and send CQEs for
+/// this fd here; dispatch by op kind. (Sends must be handled even after
+/// pause_reading, so the recv-only `reading` guard lives in readCompleted.)
+fn ioCompleted(ctx: *anyopaque, res: core.IoResult) void {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    if (res.kind == .send) sendCompleted(st, res) else readCompleted(st, res);
+}
+
+/// Recv branch: the kernel already recv'd into `res.buf`. Build a PyBytes (GIL
+/// held) and deliver data_received. The recv is multishot - the kernel keeps it
+/// armed and the loop re-arms when F_MORE drops - so this never re-submits.
+/// res.bytes==0 is a clean EOF; <0 is -errno.
+fn readCompleted(st: *State, res: core.IoResult) void {
+    if (st.conn_lost or !st.reading) return;
+    if (res.bytes == 0) {
+        handleEof(st);
+        return;
+    }
+    if (res.bytes < 0) {
+        fatalError(st, error.RecvFailed);
+        return;
+    }
+    const data = py.c.PyBytes_FromStringAndSize(res.buf.ptr, @intCast(res.buf.len));
+    if (data == null) {
+        py.c.PyErr_Clear();
+    } else {
+        const r = callDataReceived(st, data);
+        py.decref(data);
+        if (r == null) {
+            reportProtocolError(st, "data_received");
+            return;
+        }
+        py.decref(r);
+    }
 }
 
 fn handleEof(st: *State) void {
@@ -372,8 +503,7 @@ fn handleEof(st: *State) void {
         closeTransport(st, null);
     } else {
         // protocol wants the connection kept half-open: stop reading for good.
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
         st.read_eof = true;
     }
 }
@@ -382,9 +512,19 @@ fn handleEof(st: *State) void {
 // writing
 // ---------------------------------------------------------------------------
 
+/// Bytes still owed to the peer: queued plus any in-flight send (completion path).
+fn pendingWrite(st: *State) usize {
+    return st.write_buf.items.len + st.send_buf.items.len;
+}
+
 fn writeBytes(st: *State, data: []const u8) void {
     if (st.conn_lost or st.eof_sent) return;
     if (data.len == 0) return;
+
+    if (usesCompletion(st)) {
+        writeBytesCompletion(st, data);
+        return;
+    }
 
     var consumed: usize = 0;
     // Fast path: nothing buffered, try to send immediately.
@@ -405,6 +545,60 @@ fn writeBytes(st: *State, data: []const u8) void {
     };
     maybeRegisterWrite(st);
     maybePauseProtocol(st);
+}
+
+/// Completion-backend write: an io_uring SEND borrows its buffer until the CQE,
+/// so new bytes queue in `write_buf` and a single send is kept in flight from the
+/// stable `send_buf`. No sync write() - the send batches into the loop's enter.
+fn writeBytesCompletion(st: *State, data: []const u8) void {
+    st.write_buf.appendSlice(gpa, data) catch {
+        fatalError(st, error.NoBufferSpace);
+        return;
+    };
+    kickSend(st);
+    maybePauseProtocol(st);
+}
+
+/// Promote queued bytes into the in-flight send buffer and submit a SEND, unless
+/// one is already outstanding (one send in flight per fd).
+fn kickSend(st: *State) void {
+    if (st.send_inflight or st.write_buf.items.len == 0 or st.conn_lost) return;
+    std.mem.swap(std.ArrayList(u8), &st.send_buf, &st.write_buf);
+    st.write_buf.clearRetainingCapacity();
+    st.send_inflight = true;
+    st.engine.submitSend(st.fd, st.send_buf.items);
+}
+
+/// Completion-backend send callback: `res.bytes` were sent from `send_buf`. Drop
+/// them; resubmit the remainder on a partial send; otherwise promote any bytes
+/// queued meanwhile, and finish close/eof once fully drained.
+fn sendCompleted(st: *State, res: core.IoResult) void {
+    if (st.conn_lost) return;
+    st.send_inflight = false;
+    if (res.bytes < 0) {
+        fatalError(st, error.SendFailed);
+        return;
+    }
+    const sent: usize = @intCast(res.bytes);
+    const remaining = st.send_buf.items.len - sent;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, st.send_buf.items[0..remaining], st.send_buf.items[sent..]);
+    }
+    st.send_buf.shrinkRetainingCapacity(remaining);
+
+    if (st.send_buf.items.len > 0) { // partial send: resubmit the rest
+        st.send_inflight = true;
+        st.engine.submitSend(st.fd, st.send_buf.items);
+        return;
+    }
+
+    kickSend(st); // anything queued while this send was in flight
+    maybeResumeProtocol(st);
+
+    if (pendingWrite(st) == 0 and !st.send_inflight) {
+        if (st.eof_sent) sys.shutdown(st.fd, 1); // SHUT_WR after flush
+        if (st.closing) closeTransport(st, null);
+    }
 }
 
 fn maybeRegisterWrite(st: *State) void {
@@ -454,14 +648,14 @@ fn stopWriting(st: *State) void {
 // -- flow control ------------------------------------------------------------
 
 fn maybePauseProtocol(st: *State) void {
-    if (!st.writing_paused and st.write_buf.items.len > st.high_water) {
+    if (!st.writing_paused and pendingWrite(st) > st.high_water) {
         st.writing_paused = true;
         callProtocol(st, "pause_writing");
     }
 }
 
 fn maybeResumeProtocol(st: *State) void {
-    if (st.writing_paused and st.write_buf.items.len <= st.low_water) {
+    if (st.writing_paused and pendingWrite(st) <= st.low_water) {
         st.writing_paused = false;
         callProtocol(st, "resume_writing");
     }
@@ -485,8 +679,9 @@ fn callProtocol(st: *State, name: [*c]const u8) void {
 fn closeTransport(st: *State, exc: py.Object) void {
     if (st.conn_lost) return;
     st.closing = true;
-    if (st.write_buf.items.len > 0 and exc == null) {
-        // defer real close until the buffer flushes (handled in writeCallback)
+    // Defer the real close until queued + in-flight bytes flush (the readiness
+    // writeCallback or the completion sendCompleted finishes the close).
+    if ((pendingWrite(st) > 0 or st.send_inflight) and exc == null) {
         return;
     }
     doConnectionLost(st, exc);
@@ -512,9 +707,9 @@ fn doConnectionLost(st: *State, exc: py.Object) void {
 
     stopWriting(st);
     if (st.reading) {
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
     }
+    if (usesCompletion(st)) st.engine.stopIo(st.fd); // drop callback + cancel send/recv
     closeFd(st);
 
     scheduleConnectionLost(st, exc);
@@ -562,6 +757,7 @@ fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv
             py.c.PyErr_Clear();
         }
         py.clear(&st.protocol);
+        py.clear(&st.data_received);
     }
     // The loop no longer needs to keep this connection alive. Do this last: it
     // may drop the final reference and trigger dealloc.
@@ -606,8 +802,9 @@ fn t_dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
     py.clear(&t.dict);
     if (t.state) |st| {
         if (!st.conn_lost) {
-            if (st.reading) _ = st.engine.removeReader(st.fd);
+            if (st.reading) stopReading(st);
             stopWriting(st);
+            if (usesCompletion(st)) st.engine.stopIo(st.fd);
             closeFd(st);
         }
         destroyState(st);
@@ -624,6 +821,7 @@ fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) call
     if (t.dict != null) if (visit.?(t.dict, arg) != 0) return -1;
     if (t.state) |st| {
         if (st.protocol != null) if (visit.?(st.protocol, arg) != 0) return -1;
+        if (st.data_received != null) if (visit.?(st.data_received, arg) != 0) return -1;
         if (st.extra != null) if (visit.?(st.extra, arg) != 0) return -1;
         if (st.sock_obj != null) if (visit.?(st.sock_obj, arg) != 0) return -1;
         if (st.context != null) if (visit.?(st.context, arg) != 0) return -1;
@@ -639,15 +837,14 @@ fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
         // Detach from the engine before dropping the Loop reference, so a later
         // dealloc cannot touch a freed engine through st.engine.
         if (!st.conn_lost) {
-            if (st.reading) {
-                _ = st.engine.removeReader(st.fd);
-                st.reading = false;
-            }
+            if (st.reading) stopReading(st);
             stopWriting(st);
+            if (usesCompletion(st)) st.engine.stopIo(st.fd);
             closeFd(st);
             st.conn_lost = true;
         }
         py.clear(&st.protocol);
+        py.clear(&st.data_received);
         py.clear(&st.extra);
         py.clear(&st.sock_obj);
         py.clear(&st.context);
@@ -696,8 +893,7 @@ fn t_close(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (!st.closing and !st.conn_lost) {
         if (st.reading) {
-            _ = st.engine.removeReader(st.fd);
-            st.reading = false;
+            stopReading(st);
         }
         closeTransport(st, null);
     }
@@ -730,8 +926,7 @@ fn t_is_closing(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object 
 fn t_pause_reading(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (st.reading and !st.conn_lost) {
-        _ = st.engine.removeReader(st.fd);
-        st.reading = false;
+        stopReading(st);
     }
     return py.none();
 }
@@ -748,7 +943,9 @@ fn t_write_eof(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const st = stateOf(self_obj) orelse return py.none();
     if (st.eof_sent or st.conn_lost) return py.none();
     st.eof_sent = true;
-    if (st.write_buf.items.len == 0) sys.shutdown(st.fd, 1); // SHUT_WR
+    // SHUT_WR now if nothing is pending; otherwise the flush path (writeCallback
+    // or sendCompleted) shuts down once queued + in-flight bytes drain.
+    if (pendingWrite(st) == 0 and !st.send_inflight) sys.shutdown(st.fd, 1);
     return py.none();
 }
 
@@ -772,6 +969,7 @@ fn t_set_protocol(self_obj: ?*c.PyObject, proto: ?*c.PyObject) callconv(.c) py.O
     const st = stateOf(self_obj) orelse return py.none();
     py.clear(&st.protocol);
     st.protocol = py.newRef(proto.?);
+    cacheProtocolMethods(st); // rebind the cached data_received for the new protocol
     return py.none();
 }
 
