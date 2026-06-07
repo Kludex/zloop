@@ -115,6 +115,20 @@ const FdState = struct {
 const has_completion = builtin.os.tag == .linux;
 const CompletorT = if (has_completion) completion.Completor else void;
 
+/// Per-fd completion generations. recv (data) and poll (readiness) ops can be in
+/// flight on the same fd at once - a recv waiting for bytes while a POLL_ADD
+/// watches for writability - so each op family carries its own generation. A
+/// single shared counter would let registering write interest bump the recv's
+/// generation and make its completion look stale, silently dropping the data.
+const CompGen = struct {
+    recv: u32 = 0,
+    poll: u32 = 0,
+
+    fn of(self: CompGen, kind: completion.OpKind) u32 {
+        return if (kind == .poll) self.poll else self.recv;
+    }
+};
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     reactor: Reactor,
@@ -128,9 +142,9 @@ pub const Loop = struct {
     completor: ?CompletorT = null,
     /// Per-fd completion callbacks (the completion analogue of `fds`).
     comp_fds: std.AutoHashMap(sys.fd_t, CompletionCallback),
-    /// Per-fd generation, bumped each registration so a late CQE for a
-    /// closed-then-reused fd is dropped.
-    comp_gen: std.AutoHashMap(sys.fd_t, u32),
+    /// Per-fd, per-op-family generations, bumped each (re)submission so a late
+    /// CQE for a closed-then-reused fd (or a superseded op) is dropped.
+    comp_gen: std.AutoHashMap(sys.fd_t, CompGen),
 
     running: bool = false,
     stopping: bool = false,
@@ -172,7 +186,7 @@ pub const Loop = struct {
             .dispatcher = dispatcher,
             .completor = null,
             .comp_fds = std.AutoHashMap(sys.fd_t, CompletionCallback).init(allocator),
-            .comp_gen = std.AutoHashMap(sys.fd_t, u32).init(allocator),
+            .comp_gen = std.AutoHashMap(sys.fd_t, CompGen).init(allocator),
             .xthread = .empty,
             .wake_r = pipe[0],
             .wake_w = pipe[1],
@@ -184,24 +198,54 @@ pub const Loop = struct {
     /// (the Completor is self-referential), i.e. by the owner right after init().
     /// No-op (stays on readiness) when disabled or unsupported.
     pub fn setupCompletion(self: *Loop) void {
-        if (!has_completion or !completion.enabled() or self.completor != null) return;
+        if (!has_completion or !completion.enabled()) return;
+        _ = self.enableCompletion();
+    }
+
+    /// Build the completion backend regardless of the env gate. Returns false
+    /// (staying on readiness) when already enabled or the kernel lacks io_uring /
+    /// provided-buffer rings. Tests call this directly; setupCompletion gates it
+    /// on ZLOOP_IO_URING=completion.
+    fn enableCompletion(self: *Loop) bool {
+        if (!has_completion or self.completor != null) return false;
         // Init in place: the Completor is self-referential (bufs.ring points at
         // its own ring), so it must be built directly in its final storage.
         self.completor = @as(CompletorT, undefined);
         self.completor.?.init(self.allocator) catch {
             self.completor = null; // unsupported kernel -> stay on readiness
-            return;
+            return false;
         };
         // Move the wake pipe off the reactor and onto a completion POLL_ADD
         // (readiness, not a data recv - it's drained by drainWake, and a buffer
         // recv on a pipe is the wrong tool and unreliable across kernels).
         self.reactor.unregister(self.wake_r) catch {};
         self.completor.?.submitPoll(self.wake_r, true, false, completion.WAKE_UD) catch {};
+        return true;
     }
 
     /// True when this loop is using the io_uring completion backend.
     pub fn isCompletion(self: *const Loop) bool {
         return self.completor != null;
+    }
+
+    // -- per-fd completion generation helpers ---------------------------------
+
+    fn compGen(self: *Loop, fd: sys.fd_t) CompGen {
+        return self.comp_gen.get(fd) orelse .{};
+    }
+
+    /// Bump the generation for `kind` (recv or poll) on `fd` and return the new
+    /// value. The other family's generation is preserved, so a write-interest
+    /// re-arm cannot invalidate an in-flight recv (and vice versa).
+    fn bumpGen(self: *Loop, fd: sys.fd_t, kind: completion.OpKind) u32 {
+        var g = self.compGen(fd);
+        if (kind == .poll) {
+            g.poll +%= 1;
+        } else {
+            g.recv +%= 1;
+        }
+        self.comp_gen.put(fd, g) catch {};
+        return g.of(kind);
     }
 
     /// Release every deferred-callback token the engine still owns (ready queue,
@@ -365,9 +409,9 @@ pub const Loop = struct {
             // On the completion backend, readiness for non-data fds (accept,
             // connect, signals) is a multishot POLL_ADD. modify = cancel + re-arm.
             const i = state.interest();
-            const g = (self.comp_gen.get(fd) orelse 0) +% 1;
-            try self.comp_gen.put(fd, g);
-            if (!is_new) self.completor.?.cancel(completion.UserData.make(.poll, fd, g -% 1), completion.WAKE_UD);
+            const prev = self.compGen(fd).poll;
+            const g = self.bumpGen(fd, .poll);
+            if (!is_new) self.completor.?.cancel(completion.UserData.make(.poll, fd, prev), completion.WAKE_UD);
             try self.completor.?.submitPoll(fd, i.read, i.write, completion.UserData.make(.poll, fd, g));
             return;
         }
@@ -380,15 +424,16 @@ pub const Loop = struct {
 
     fn syncFdUnreg(self: *Loop, fd: sys.fd_t, state: FdState) void {
         if (has_completion and self.completor != null) {
-            const g = self.comp_gen.get(fd) orelse 0;
+            // Cancel the current POLL_ADD and bump only the poll generation; an
+            // in-flight recv (tracked separately via comp_fds/recv gen) is left
+            // untouched so its completion still delivers.
+            const prev = self.compGen(fd).poll;
+            self.completor.?.cancel(completion.UserData.make(.poll, fd, prev), completion.WAKE_UD);
+            const ng = self.bumpGen(fd, .poll);
             if (state.isEmpty()) {
-                self.completor.?.cancel(completion.UserData.make(.poll, fd, g), completion.WAKE_UD);
-                self.comp_gen.put(fd, g +% 1) catch {};
                 _ = self.fds.remove(fd);
+                self.gcGen(fd);
             } else {
-                self.completor.?.cancel(completion.UserData.make(.poll, fd, g), completion.WAKE_UD);
-                const ng = g +% 1;
-                self.comp_gen.put(fd, ng) catch {};
                 self.completor.?.submitPoll(fd, state.interest().read, state.interest().write, completion.UserData.make(.poll, fd, ng)) catch {};
             }
             return;
@@ -399,6 +444,14 @@ pub const Loop = struct {
         } else {
             self.reactor.modify(fd, fdToken(fd), state.interest()) catch {};
         }
+    }
+
+    /// Drop the generation entry for `fd` once neither a readiness watch (`fds`)
+    /// nor a data op (`comp_fds`) remains. Keeping it while either is live is what
+    /// lets a late CQE be recognized as stale; removing it too early would reset
+    /// the counter to 0 and let a stale CQE masquerade as current after reuse.
+    fn gcGen(self: *Loop, fd: sys.fd_t) void {
+        if (!self.fds.contains(fd) and !self.comp_fds.contains(fd)) _ = self.comp_gen.remove(fd);
     }
 
     fn fdToken(fd: sys.fd_t) usize {
@@ -528,8 +581,11 @@ pub const Loop = struct {
         const fd = completion.UserData.fd(comp.user_data);
         const gen = completion.UserData.gen(comp.user_data);
         const kind = completion.UserData.kind(comp.user_data);
-        // Drop a late CQE whose generation no longer matches (fd was reused).
-        if ((self.comp_gen.get(fd) orelse gen) != gen) {
+        // Drop a late CQE whose generation no longer matches its op family (fd
+        // reused, or the op superseded). recv and poll carry independent
+        // generations, so a write-interest re-arm never invalidates a live recv.
+        const cur = if (self.comp_gen.get(fd)) |g| g.of(kind) else gen;
+        if (cur != gen) {
             if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
             return;
         }
@@ -564,8 +620,7 @@ pub const Loop = struct {
     /// transport calls this instead of addReader on the completion backend.
     pub fn startRecv(self: *Loop, fd: sys.fd_t, cb: CompletionCallback) !void {
         if (!has_completion) return;
-        const g = (self.comp_gen.get(fd) orelse 0) +% 1;
-        try self.comp_gen.put(fd, g);
+        const g = self.bumpGen(fd, .recv);
         var entry = cb;
         entry.gen = g;
         try self.comp_fds.put(fd, entry);
@@ -573,29 +628,33 @@ pub const Loop = struct {
     }
 
     /// Re-arm a recv after a completion (single-shot recv, one in flight per fd).
+    /// Keeps the same recv generation - it continues the same logical read stream.
     pub fn rearmRecv(self: *Loop, fd: sys.fd_t) void {
         if (!has_completion) return;
-        const g = self.comp_gen.get(fd) orelse return;
+        const g = (self.comp_gen.get(fd) orelse return).recv;
         self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g)) catch {};
     }
 
     /// Submit a send of `buf` (kernel-borrowed until completion; caller pins it).
+    /// Sends share the recv (data) generation family.
     pub fn submitSend(self: *Loop, fd: sys.fd_t, buf: []const u8) void {
         if (!has_completion) return;
-        const g = self.comp_gen.get(fd) orelse 0;
+        const g = self.compGen(fd).recv;
         self.completor.?.submitSend(fd, buf, completion.UserData.make(.send, fd, g)) catch {};
     }
 
-    /// Cancel outstanding ops for `fd` and drop its completion handler. The
-    /// cancellations complete as -ECANCELED and are ignored (gen bumped).
+    /// Cancel outstanding recv/send for `fd` and drop its completion handler. The
+    /// cancellations complete as -ECANCELED and are ignored (recv gen bumped).
     pub fn stopIo(self: *Loop, fd: sys.fd_t) void {
         if (!has_completion) return;
         if (self.comp_fds.fetchRemove(fd)) |kv| {
             kv.value.dispose_();
-            const g = self.comp_gen.get(fd) orelse 0;
+            const g = self.compGen(fd).recv;
             self.completor.?.cancel(completion.UserData.make(.recv, fd, g), completion.WAKE_UD);
-            // Bump generation so any late CQE for this fd is dropped.
-            self.comp_gen.put(fd, g +% 1) catch {};
+            // Bump the recv generation so any late recv/send CQE is dropped, then
+            // drop the gen entry if no readiness watch remains on this fd.
+            _ = self.bumpGen(fd, .recv);
+            self.gcGen(fd);
         }
     }
 
@@ -718,4 +777,63 @@ test "wakeup interrupts an otherwise-blocking poll" {
     loop.wakeup();
     try loop.runOnce(null);
     try testing.expectEqual(@as(usize, 0), td.runs.items.len);
+}
+
+const RecvRecorder = struct {
+    bytes: isize = -2, // sentinel: callback never fired
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+    fn cb(ctx: *anyopaque, res: IoResult) void {
+        const self: *RecvRecorder = @ptrCast(@alignCast(ctx));
+        self.bytes = res.bytes;
+        if (res.bytes > 0) {
+            const n = @min(res.buf.len, self.buf.len);
+            @memcpy(self.buf[0..n], res.buf[0..n]);
+            self.len = n;
+        }
+    }
+    fn callback(self: *RecvRecorder) CompletionCallback {
+        return .{ .func = cb, .ctx = self };
+    }
+};
+
+// Regression: a pending recv must survive registering write interest on the same
+// fd. recv and POLL_ADD carry independent generations; a single shared counter
+// let addWriter's POLL_ADD bump the recv's generation, so the recv completion was
+// dropped as stale and the data silently lost. (Linux io_uring only; skipped when
+// the kernel lacks io_uring / provided-buffer rings.)
+test "completion: write interest does not drop a pending recv" {
+    if (!has_completion) return;
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    if (!loop.enableCompletion()) return; // old kernel -> skip
+
+    const fds = try sys.socketPair();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    var rec = RecvRecorder{};
+    try loop.startRecv(fds[0], rec.callback());
+
+    // Register write interest on the SAME fd: this submits a POLL_ADD and, with
+    // the bug, would bump the (shared) generation and strand the recv above.
+    var wcounter = IoCounter{};
+    try loop.addWriter(fds[0], wcounter.callback());
+
+    // Now send data to the recv side. The recv must still deliver it.
+    _ = try sys.write(fds[1], "ping");
+
+    var iters: usize = 0;
+    while (rec.bytes == -2 and iters < 20) : (iters += 1) {
+        try loop.runOnce(20 * std.time.ns_per_ms);
+    }
+
+    try testing.expectEqual(@as(isize, 4), rec.bytes);
+    try testing.expectEqualStrings("ping", rec.buf[0..rec.len]);
+
+    loop.stopIo(fds[0]);
+    _ = loop.removeWriter(fds[0]);
 }
