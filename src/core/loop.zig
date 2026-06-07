@@ -12,6 +12,7 @@
 //!     installs a closure that just enqueues a Handle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const reactor_mod = @import("reactor.zig");
 const timers_mod = @import("timers.zig");
 const queue_mod = @import("queue.zig");
@@ -59,6 +60,34 @@ pub const IoCallback = struct {
     }
 };
 
+// -- completion backend (Phase 2, Linux io_uring) -----------------------------
+const completion = @import("completor.zig");
+
+/// Result of a completed I/O op delivered to a transport on the completion path.
+/// `bytes` >= 0 is the count moved; < 0 is -errno. For a recv, `buf` is the
+/// kernel-filled slice, valid only during the callback (recycle happens after).
+pub const IoResult = struct {
+    kind: completion.OpKind,
+    bytes: isize,
+    buf: []const u8 = &.{},
+};
+
+/// A native completion callback owned by a transport. Receives op results rather
+/// than readiness edges. `dispose` releases the owner when the fd is dropped.
+pub const CompletionCallback = struct {
+    func: *const fn (ctx: *anyopaque, res: IoResult) void,
+    ctx: *anyopaque,
+    dispose: ?*const fn (ctx: *anyopaque) void = null,
+    gen: u32 = 0, // current generation; a CQE with a stale gen is dropped
+
+    fn fire(self: CompletionCallback, res: IoResult) void {
+        self.func(self.ctx, res);
+    }
+    fn dispose_(self: CompletionCallback) void {
+        if (self.dispose) |d| d(self.ctx);
+    }
+};
+
 /// A minimal spinlock for the brief cross-thread inbox critical section.
 const SpinLock = struct {
     state: std.atomic.Mutex = .unlocked,
@@ -82,6 +111,10 @@ const FdState = struct {
     }
 };
 
+/// Whether the completion backend is even compilable on this target.
+const has_completion = builtin.os.tag == .linux;
+const CompletorT = if (has_completion) completion.Completor else void;
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     reactor: Reactor,
@@ -89,6 +122,15 @@ pub const Loop = struct {
     ready: ReadyQueue,
     fds: std.AutoHashMap(sys.fd_t, FdState),
     dispatcher: Dispatcher,
+
+    /// Completion backend (io_uring), used instead of `reactor` when
+    /// ZLOOP_IO_URING=completion and the kernel supports it. null = readiness.
+    completor: ?CompletorT = null,
+    /// Per-fd completion callbacks (the completion analogue of `fds`).
+    comp_fds: std.AutoHashMap(sys.fd_t, CompletionCallback),
+    /// Per-fd generation, bumped each registration so a late CQE for a
+    /// closed-then-reused fd is dropped.
+    comp_gen: std.AutoHashMap(sys.fd_t, u32),
 
     running: bool = false,
     stopping: bool = false,
@@ -117,6 +159,8 @@ pub const Loop = struct {
         try sys.setNonBlocking(pipe[1]);
         try sys.setCloexec(pipe[0]);
         try sys.setCloexec(pipe[1]);
+        // Wake pipe goes on the reactor by default; setupCompletion() moves it to
+        // the completor when the completion backend is enabled.
         try r.register(pipe[0], WAKE_TOKEN, .{ .read = true });
 
         return .{
@@ -126,10 +170,36 @@ pub const Loop = struct {
             .ready = ReadyQueue.init(allocator),
             .fds = std.AutoHashMap(sys.fd_t, FdState).init(allocator),
             .dispatcher = dispatcher,
+            .completor = null,
+            .comp_fds = std.AutoHashMap(sys.fd_t, CompletionCallback).init(allocator),
+            .comp_gen = std.AutoHashMap(sys.fd_t, u32).init(allocator),
             .xthread = .empty,
             .wake_r = pipe[0],
             .wake_w = pipe[1],
         };
+    }
+
+    /// Enable the io_uring completion backend if ZLOOP_IO_URING=completion and the
+    /// kernel supports it. MUST be called after the Loop is at its final address
+    /// (the Completor is self-referential), i.e. by the owner right after init().
+    /// No-op (stays on readiness) when disabled or unsupported.
+    pub fn setupCompletion(self: *Loop) void {
+        if (!has_completion or !completion.enabled() or self.completor != null) return;
+        // Init in place: the Completor is self-referential (bufs.ring points at
+        // its own ring), so it must be built directly in its final storage.
+        self.completor = @as(CompletorT, undefined);
+        self.completor.?.init(self.allocator) catch {
+            self.completor = null; // unsupported kernel -> stay on readiness
+            return;
+        };
+        // Move the wake pipe off the reactor and onto a completion recv.
+        self.reactor.unregister(self.wake_r) catch {};
+        self.completor.?.submitRecv(self.wake_r, completion.WAKE_UD) catch {};
+    }
+
+    /// True when this loop is using the io_uring completion backend.
+    pub fn isCompletion(self: *const Loop) bool {
+        return self.completor != null;
     }
 
     /// Release every deferred-callback token the engine still owns (ready queue,
@@ -160,8 +230,15 @@ pub const Loop = struct {
             if (st.reader) |cb| cb.dispose_();
             if (st.writer) |cb| cb.dispose_();
         }
+        var cit = self.comp_fds.valueIterator();
+        while (cit.next()) |cb| cb.dispose_();
         sys.close(self.wake_r);
         sys.close(self.wake_w);
+        if (has_completion) {
+            if (self.completor) |*co| co.deinit();
+        }
+        self.comp_fds.deinit();
+        self.comp_gen.deinit();
         self.reactor.deinit();
         self.timers.deinit();
         self.ready.deinit();
@@ -334,25 +411,38 @@ pub const Loop = struct {
             if (self.dispatcher.suspend_) |s| resume_state = s(self.dispatcher.ctx);
         }
 
-        var events: [256]reactor_mod.Event = undefined;
-        const poll_result = self.reactor.poll(&events, timeout);
-
-        if (will_block) {
-            if (self.dispatcher.resume_) |r| r(self.dispatcher.ctx, resume_state);
-        }
-
-        const ready_events = try poll_result;
-
-        for (ready_events) |ev| {
-            if (ev.token == WAKE_TOKEN) {
-                self.drainWake();
-                continue;
+        if (has_completion and self.completor != null) {
+            const co = &self.completor.?;
+            var comps: [256]completion.Completion = undefined;
+            const reap_result = co.reap(&comps, timeout);
+            if (will_block) {
+                if (self.dispatcher.resume_) |r| r(self.dispatcher.ctx, resume_state);
             }
-            const fd: sys.fd_t = @intCast(ev.token);
-            const state = self.fds.get(fd) orelse continue;
-            const io: IoEvent = .{ .readable = ev.readable, .writable = ev.writable, .hup = ev.hup };
-            if (ev.readable or ev.hup) if (state.reader) |cb| cb.fire(io);
-            if (ev.writable or ev.hup) if (state.writer) |cb| cb.fire(io);
+            const done = try reap_result;
+            for (done) |comp| {
+                self.dispatchCompletion(comp);
+            }
+        } else {
+            var events: [256]reactor_mod.Event = undefined;
+            const poll_result = self.reactor.poll(&events, timeout);
+
+            if (will_block) {
+                if (self.dispatcher.resume_) |r| r(self.dispatcher.ctx, resume_state);
+            }
+
+            const ready_events = try poll_result;
+
+            for (ready_events) |ev| {
+                if (ev.token == WAKE_TOKEN) {
+                    self.drainWake();
+                    continue;
+                }
+                const fd: sys.fd_t = @intCast(ev.token);
+                const state = self.fds.get(fd) orelse continue;
+                const io: IoEvent = .{ .readable = ev.readable, .writable = ev.writable, .hup = ev.hup };
+                if (ev.readable or ev.hup) if (state.reader) |cb| cb.fire(io);
+                if (ev.writable or ev.hup) if (state.writer) |cb| cb.fire(io);
+            }
         }
 
         const t_now = clock.nowNs();
@@ -386,6 +476,72 @@ pub const Loop = struct {
         var buf: [256]u8 = undefined;
         while (true) {
             _ = sys.read(self.wake_r, &buf) catch break;
+        }
+    }
+
+    // -- completion-backend dispatch & submission (Phase 2) -------------------
+
+    fn dispatchCompletion(self: *Loop, comp: completion.Completion) void {
+        const co = &self.completor.?;
+        // The wake pipe's recv: drain it and re-arm; cross-thread work is already
+        // in `ready` via drainXthread at the top of runOnce.
+        if (comp.user_data == completion.WAKE_UD) {
+            self.drainWake();
+            co.submitRecv(self.wake_r, completion.WAKE_UD) catch {};
+            return;
+        }
+        const fd = completion.UserData.fd(comp.user_data);
+        const gen = completion.UserData.gen(comp.user_data);
+        // Recycle a recv buffer regardless of whether we still have a callback,
+        // so the kernel ring never starves on a closed connection.
+        defer if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
+
+        const cb = self.comp_fds.get(fd) orelse return; // gone fd
+        // Drop a late CQE whose generation no longer matches (fd was reused).
+        if ((self.comp_gen.get(fd) orelse gen) != gen) return;
+        cb.fire(.{
+            .kind = completion.UserData.kind(comp.user_data),
+            .bytes = comp.result,
+            .buf = comp.buf,
+        });
+    }
+
+    /// Register `cb` as the completion handler for `fd` and submit a recv. The
+    /// transport calls this instead of addReader on the completion backend.
+    pub fn startRecv(self: *Loop, fd: sys.fd_t, cb: CompletionCallback) !void {
+        if (!has_completion) return;
+        const g = (self.comp_gen.get(fd) orelse 0) +% 1;
+        try self.comp_gen.put(fd, g);
+        var entry = cb;
+        entry.gen = g;
+        try self.comp_fds.put(fd, entry);
+        try self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g));
+    }
+
+    /// Re-arm a recv after a completion (single-shot recv, one in flight per fd).
+    pub fn rearmRecv(self: *Loop, fd: sys.fd_t) void {
+        if (!has_completion) return;
+        const g = self.comp_gen.get(fd) orelse return;
+        self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g)) catch {};
+    }
+
+    /// Submit a send of `buf` (kernel-borrowed until completion; caller pins it).
+    pub fn submitSend(self: *Loop, fd: sys.fd_t, buf: []const u8) void {
+        if (!has_completion) return;
+        const g = self.comp_gen.get(fd) orelse 0;
+        self.completor.?.submitSend(fd, buf, completion.UserData.make(.send, fd, g)) catch {};
+    }
+
+    /// Cancel outstanding ops for `fd` and drop its completion handler. The
+    /// cancellations complete as -ECANCELED and are ignored (gen bumped).
+    pub fn stopIo(self: *Loop, fd: sys.fd_t) void {
+        if (!has_completion) return;
+        if (self.comp_fds.fetchRemove(fd)) |kv| {
+            kv.value.dispose_();
+            const g = self.comp_gen.get(fd) orelse 0;
+            self.completor.?.cancel(completion.UserData.make(.recv, fd, g), completion.WAKE_UD);
+            // Bump generation so any late CQE for this fd is dropped.
+            self.comp_gen.put(fd, g +% 1) catch {};
         }
     }
 
