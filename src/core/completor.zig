@@ -93,10 +93,14 @@ pub const Completor = struct {
     /// the ring and leave bufs.ring dangling (a recv would then hang on a stale
     /// ring), so the caller must give us our final location.
     pub fn init(self: *Completor, allocator: std.mem.Allocator) !void {
-        // Plain ring. (SINGLE_ISSUER/DEFER_TASKRUN would fit a single-threaded
-        // loop, but DEFER_TASKRUN defers completion processing to GETEVENTS-only
-        // and complicates the reap path; revisit as a perf tweak once correct.)
-        self.ring = IoUring.init(QUEUE_DEPTH, 0) catch return error.CompletorInitFailed;
+        // One thread owns each ring (one loop per thread), so SINGLE_ISSUER holds.
+        // DEFER_TASKRUN then defers completion processing to our submit_and_wait
+        // (reap always calls it), cutting the cross-thread kernel task-work that
+        // otherwise scales with the number of parallel loops. Both need a recent
+        // kernel; fall back to a plain ring if init rejects the flags.
+        const flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN;
+        self.ring = IoUring.init(QUEUE_DEPTH, flags) catch
+            IoUring.init(QUEUE_DEPTH, 0) catch return error.CompletorInitFailed;
         errdefer self.ring.deinit();
         self.allocator = allocator;
         // Provided-buffer ring (needs kernel 5.19+) built against our OWN ring.
@@ -110,40 +114,57 @@ pub const Completor = struct {
         self.ring.deinit();
     }
 
-    /// Submit a single-shot recv for `fd` drawing from the provided-buffer ring.
-    /// The transport re-submits after each completion (one recv in flight per fd).
-    /// Single-shot (not multishot) for delivery predictability across kernels;
-    /// multishot can be a later optimization.
-    pub fn submitRecv(self: *Completor, fd: sys.fd_t, ud: u64) !void {
-        _ = self.bufs.recv(ud, fd, 0) catch return error.SubmitFailed;
-        _ = self.ring.submit() catch return error.SubmitFailed;
+    /// Ensure a free SQE is available, flushing the queue to the kernel first if
+    /// it is full. Ops are otherwise queued and submitted in one batch by reap,
+    /// so a busy loop turn costs a single io_uring_enter instead of one per op.
+    fn ensureSqe(self: *Completor) !*linux.io_uring_sqe {
+        return self.ring.get_sqe() catch {
+            _ = self.ring.submit() catch return error.SubmitFailed;
+            return self.ring.get_sqe() catch return error.SubmitFailed;
+        };
     }
 
-    /// Submit a multishot POLL_ADD for readiness (accept/connect/signals - fds
+    /// Queue a multishot recv for `fd` drawing from the provided-buffer ring: the
+    /// kernel keeps it armed and posts a CQE per arrival (F_MORE set), so the
+    /// transport does not re-submit per message. It only needs re-arming when the
+    /// kernel drops F_MORE (e.g. the buffer ring momentarily ran dry). Not
+    /// submitted here - reap flushes it.
+    pub fn submitRecv(self: *Completor, fd: sys.fd_t, ud: u64) !void {
+        const sqe = try self.ensureSqe();
+        sqe.prep_rw(.RECV, fd, 0, 0, 0);
+        sqe.rw_flags = 0;
+        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+        sqe.buf_index = self.bufs.group_id;
+        sqe.user_data = ud;
+    }
+
+    /// Queue a multishot POLL_ADD for readiness (accept/connect/signals - fds
     /// that aren't plain-socket data). Re-arms until F_MORE clears.
     pub fn submitPoll(self: *Completor, fd: sys.fd_t, want_read: bool, want_write: bool, ud: u64) !void {
         var mask: u32 = 0;
         if (want_read) mask |= POLLIN;
         if (want_write) mask |= POLLOUT;
-        const sqe = self.ring.poll_add(ud, fd, mask) catch return error.SubmitFailed;
+        const sqe = try self.ensureSqe();
+        sqe.prep_poll_add(fd, mask);
         sqe.len |= linux.IORING_POLL_ADD_MULTI;
-        _ = self.ring.submit() catch return error.SubmitFailed;
+        sqe.user_data = ud;
     }
 
-    /// Submit a send of `buf` (borrowed by the kernel until the send completes —
+    /// Queue a send of `buf` (borrowed by the kernel until the send completes —
     /// the caller MUST keep it alive and unmodified until the matching reap).
     pub fn submitSend(self: *Completor, fd: sys.fd_t, buf: []const u8, ud: u64) !void {
-        _ = self.ring.send(ud, fd, buf, 0) catch return error.SubmitFailed;
-        _ = self.ring.submit() catch return error.SubmitFailed;
+        const sqe = try self.ensureSqe();
+        sqe.prep_send(fd, buf, 0);
+        sqe.user_data = ud;
     }
 
-    /// Ask the kernel to cancel every outstanding op tagged with `target_ud`.
-    /// The cancelled ops complete with -ECANCELED, reaped like any other.
+    /// Queue a cancel of every outstanding op tagged with `target_ud`. The
+    /// cancelled ops complete with -ECANCELED, reaped like any other.
     pub fn cancel(self: *Completor, target_ud: u64, ud: u64) void {
-        const sqe = self.ring.get_sqe() catch return;
+        const sqe = self.ensureSqe() catch return;
         sqe.prep_cancel(target_ud, 0);
         sqe.user_data = ud;
-        _ = self.ring.submit() catch {};
     }
 
     /// Recycle a recv buffer (by its completion) back to the kernel ring.
@@ -159,7 +180,12 @@ pub const Completor = struct {
         const wait_nr: u32 = if (timeout_ns) |ns| blk: {
             if (ns == 0) break :blk 0;
             ts = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-            _ = self.ring.timeout(WAKE_UD, &ts, 0, 0) catch {};
+            // Queue the wait-bounding timeout alongside whatever ops accumulated
+            // this turn; submit_and_wait below flushes them all in one enter.
+            if (self.ensureSqe()) |sqe| {
+                sqe.prep_timeout(&ts, 0, 0);
+                sqe.user_data = WAKE_UD;
+            } else |_| {}
             break :blk 1;
         } else 1;
 

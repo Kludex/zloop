@@ -68,24 +68,25 @@ N independent loops on N threads, 8 conns/thread, 1 KB messages, 2s each, 3-samp
 medians (12-CPU host). uvloop runs here too: it imports on 3.14t without forcing
 the GIL back on and drives one loop per thread fine.
 
-| threads | zloop epoll | zloop io_uring | uvloop    | completion vs epoll |
-| ------: | ----------: | -------------: | --------: | ------------------: |
-|       1 |     154,511 |        153,869 |   169,291 | -0.4%               |
-|       2 |     272,715 |        289,157 |   315,506 | +6.0%               |
-|       4 |     424,232 |        474,653 |   568,518 | +11.9%              |
-|       8 |     649,797 |        741,102 |   964,408 | +14.0%              |
-|      16 |     729,711 |        834,004 | 1,133,503 | +14.3%              |
+| threads | zloop epoll | zloop io_uring | uvloop    | completion vs uvloop |
+| ------: | ----------: | -------------: | --------: | -------------------: |
+|       1 |     157,684 |        199,489 |   173,537 | **+15.0%**           |
+|       2 |     272,095 |        358,838 |   321,936 | **+11.5%**           |
+|       4 |     480,934 |        629,977 |   607,786 | **+3.7%**            |
+|       8 |     647,740 |        917,239 | 1,029,682 | -10.9%               |
+|      16 |     726,142 |      1,089,033 | 1,268,657 | -14.2%               |
 
-Two honest readings:
+The completion backend (`ZLOOP_IO_URING=completion`) **beats uvloop at 1-4 parallel
+free-threaded loops** and beats zloop's own epoll default everywhere. The wins come
+from making the io_uring path lean: batched submits (one `io_uring_enter` per loop
+turn, not per op), multishot recv, and completion-path writes (SEND on the ring, no
+per-message `write()` syscall) - together they cut a busy single loop from ~17.7k to
+~3.6k enters and drop write syscalls to zero.
 
-- The io_uring completion backend **does** beat zloop's own epoll default once the
-  loops parallelize off the GIL (~+14% at 8-16 threads) - that's the design point.
-- But **uvloop wins outright at every thread count** (~25-35% ahead of completion).
-  So free-threaded parallelism is not yet a place where zloop beats uvloop; the
-  single-loop epoll wins above are. Catching uvloop here is open work (see the PR's
-  deferred items: multishot recv, batched submits, completion-path writes).
-
-Enable the completion backend with `ZLOOP_IO_URING=completion`.
+Past ~8 loops on this 12-CPU host the workload is oversubscribed and the bottleneck
+moves from syscall efficiency to CPU-per-request, where uvloop's mature hot path
+still leads; closing that means cutting per-request CPU (e.g. the per-recv PyBytes
+copy), not more io_uring tuning.
 
 ## Caveats
 
