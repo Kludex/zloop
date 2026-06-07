@@ -12,5 +12,9 @@ zig build test
 ./build_ext.sh "$(pwd)/.venv/bin/python"
 .venv/bin/python -c "import zloop; print(zloop.new_event_loop())"
 
-# Build the docs so a broken site fails CI before it ever ships.
-.venv/bin/python -m zensical build
+# Build the docs so a broken site fails CI before it ever ships. Skippable when
+# the docs group isn't installed (e.g. the free-threaded leg, where zensical has
+# no free-threaded wheel).
+if [ -z "$ZLOOP_SKIP_DOCS" ]; then
+    .venv/bin/python -m zensical build
+fi

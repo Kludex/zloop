@@ -19,6 +19,10 @@ jobs:
       matrix:
         os: ["ubuntu-latest", "macos-latest"]
         python-version: ["3.12", "3.13", "3.14"]
+        # Free-threaded leg (Ubuntu only): verifies zloop runs GIL-free.
+        include:
+          - os: "ubuntu-latest"
+            python-version: "3.14t"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -33,15 +37,26 @@ jobs:
           python-version: "${{ matrix.python-version }}"
           enable-cache: true
 
+      # The free-threaded leg skips the docs group: zensical has no free-threaded
+      # wheel and can't build from source there.
       - name: Install dependencies
         run: scripts/install
+        env:
+          ZLOOP_SYNC_GROUPS: "${{ matrix.python-version == '3.14t' && '--group dev --group bench' || '' }}"
 
       - name: Run checks
-        if: "${{ matrix.os == 'ubuntu-latest' }}"
+        if: "${{ matrix.os == 'ubuntu-latest' && matrix.python-version != '3.14t' }}"
         run: scripts/check
 
       - name: Build the Zig core, extension, and docs
         run: scripts/build
+        env:
+          ZLOOP_SKIP_DOCS: "${{ matrix.python-version == '3.14t' && '1' || '' }}"
+
+      - name: Assert the GIL is disabled (free-threaded leg)
+        if: "${{ matrix.python-version == '3.14t' }}"
+        run: |
+          .venv/bin/python -c "import sys, zloop; assert sys._is_gil_enabled() is False, 'GIL was re-enabled; SetGIL declaration missing or failed'"
 
       - name: Run tests
         run: scripts/test
