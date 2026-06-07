@@ -15,7 +15,12 @@ ROOT = Path(__file__).parent
 # cibuildwheel builds every macOS wheel on the arm64 runner and asks for a
 # specific arch through ARCHFLAGS; translate it into a Zig cross-compile target
 # so the produced `.so` matches the wheel tag delocate enforces.
-_MACOS_ZIG_TARGET = {"arm64": "aarch64-macos", "x86_64": "x86_64-macos"}
+_MACOS_ZIG_ARCH = {"arm64": "aarch64-macos", "x86_64": "x86_64-macos"}
+
+# Pin the binary's minimum macOS to match MACOSX_DEPLOYMENT_TARGET (set by
+# cibuildwheel), so the wheel tag and the `.so`'s required OS version agree and
+# delocate accepts the repaired wheel.
+_MACOS_DEFAULT_MIN = "11.0"
 
 
 def _zig_target_args() -> list[str]:
@@ -23,8 +28,11 @@ def _zig_target_args() -> list[str]:
     arches = archflags.split()[1::2]  # "-arch x86_64 -arch arm64" -> ["x86_64", "arm64"]
     if len(arches) != 1 or sys.platform != "darwin":
         return []
-    target = _MACOS_ZIG_TARGET.get(arches[0])
-    return [f"-Dtarget={target}"] if target else []
+    arch = _MACOS_ZIG_ARCH.get(arches[0])
+    if not arch:
+        return []
+    min_version = os.environ.get("MACOSX_DEPLOYMENT_TARGET", _MACOS_DEFAULT_MIN)
+    return [f"-Dtarget={arch}.{min_version}"]
 
 
 def _zig_command() -> list[str]:
