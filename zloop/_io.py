@@ -19,6 +19,7 @@ import signal as signal_module
 import socket
 import ssl as ssl_module
 import threading
+from asyncio import base_events
 from typing import Any
 
 from zloop import _zloop
@@ -465,7 +466,9 @@ class Loop(_zloop.Loop):
                 try:
                     if local_addr is not None:
                         sock.bind(local_addr)
-                    await self._sock_connect(sock, address)
+                    fut: asyncio.Future[None] = self.create_future()
+                    self._sock_connect_start(fut, sock, address)
+                    await fut
                     break
                 except OSError as exc:
                     sock.close()
@@ -510,25 +513,213 @@ class Loop(_zloop.Loop):
                 sock.close()
         return transport, protocol
 
-    async def _sock_connect(self, sock: socket.socket, address: Any) -> None:
+    # -- low-level socket coroutines (sock_*) ---------------------------------
+    #
+    # Mirrors asyncio's BaseSelectorEventLoop, adapted to the engine's readiness
+    # primitives (add_reader/add_writer take *args but return no Handle, and
+    # allow one reader and one writer per fd). Each method tries the syscall
+    # once, then registers a callback that retries on readiness; a future
+    # done-callback removes the registration on completion or cancellation.
+
+    def _ensure_fd_no_transport(self, sock: socket.socket) -> None:
+        fd = sock.fileno()
+        for transport in getattr(self, "_transports", ()):
+            other = transport.get_extra_info("socket")
+            if other is not None and other.fileno() == fd and not transport.is_closing():
+                raise RuntimeError(f"File descriptor {fd!r} is used by transport {transport!r}")
+
+    def _check_sock(self, sock: socket.socket) -> None:
+        base_events._check_ssl_socket(sock)  # type: ignore[attr-defined]
+        if self.get_debug() and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+
+    async def sock_recv(self, sock: socket.socket, n: int) -> bytes:
+        self._check_sock(sock)
+        try:
+            return sock.recv(n)
+        except (BlockingIOError, InterruptedError):
+            pass
+        return await self._sock_read(sock, lambda: sock.recv(n))
+
+    async def sock_recv_into(self, sock: socket.socket, buf: Any) -> int:
+        self._check_sock(sock)
+        try:
+            return sock.recv_into(buf)
+        except (BlockingIOError, InterruptedError):
+            pass
+        return await self._sock_read(sock, lambda: sock.recv_into(buf))
+
+    async def sock_recvfrom(self, sock: socket.socket, bufsize: int) -> Any:
+        self._check_sock(sock)
+        try:
+            return sock.recvfrom(bufsize)
+        except (BlockingIOError, InterruptedError):
+            pass
+        return await self._sock_read(sock, lambda: sock.recvfrom(bufsize))
+
+    async def sock_recvfrom_into(self, sock: socket.socket, buf: Any, nbytes: int = 0) -> Any:
+        self._check_sock(sock)
+        if not nbytes:
+            nbytes = len(buf)
+        try:
+            return sock.recvfrom_into(buf, nbytes)
+        except (BlockingIOError, InterruptedError):
+            pass
+        return await self._sock_read(sock, lambda: sock.recvfrom_into(buf, nbytes))
+
+    async def _sock_read(self, sock: socket.socket, attempt: Any) -> Any:
+        self._ensure_fd_no_transport(sock)
+        fut: asyncio.Future[Any] = self.create_future()
+        fd = sock.fileno()
+        self.add_reader(fd, self._sock_retry, fut, attempt)
+        fut.add_done_callback(functools.partial(self._sock_read_done, fd))
+        return await fut
+
+    def _sock_read_done(self, fd: int, fut: asyncio.Future[Any]) -> None:
+        self.remove_reader(fd)
+
+    def _sock_write_done(self, fd: int, fut: asyncio.Future[Any]) -> None:
+        self.remove_writer(fd)
+
+    def _sock_retry(self, fut: asyncio.Future[Any], attempt: Any) -> None:
+        if fut.done():
+            return
+        try:
+            result = attempt()
+        except (BlockingIOError, InterruptedError):  # pragma: no cover - spurious readiness wakeup
+            return
+        except (SystemExit, KeyboardInterrupt):  # pragma: no cover - parity with asyncio
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    async def sock_sendall(self, sock: socket.socket, data: Any) -> None:
+        self._check_sock(sock)
+        try:
+            n = sock.send(data)
+        except (BlockingIOError, InterruptedError):
+            n = 0
+        if n == len(data):
+            return
+        self._ensure_fd_no_transport(sock)
+        fut: asyncio.Future[None] = self.create_future()
+        fd = sock.fileno()
+        self.add_writer(fd, self._sock_sendall, fut, sock, memoryview(data), [n])
+        fut.add_done_callback(functools.partial(self._sock_write_done, fd))
+        return await fut
+
+    def _sock_sendall(self, fut: asyncio.Future[None], sock: socket.socket, view: memoryview, pos: list[int]) -> None:
+        if fut.done():
+            return
+        start = pos[0]
+        try:
+            n = sock.send(view[start:])
+        except (BlockingIOError, InterruptedError):  # pragma: no cover - spurious writability wakeup
+            return
+        except (SystemExit, KeyboardInterrupt):  # pragma: no cover - parity with asyncio
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+            return
+        start += n
+        if start == len(view):
+            fut.set_result(None)
+        else:  # pragma: no cover - kernel buffer drained in one pass under test
+            pos[0] = start
+
+    async def sock_sendto(self, sock: socket.socket, data: Any, address: Any) -> int:
+        self._check_sock(sock)
+        try:
+            return sock.sendto(data, address)
+        except (BlockingIOError, InterruptedError):  # pragma: no cover - datagram sends rarely block on loopback
+            return await self._sock_sendto_deferred(sock, data, address)
+
+    async def _sock_sendto_deferred(  # pragma: no cover - datagram sends rarely block on loopback
+        self, sock: socket.socket, data: Any, address: Any
+    ) -> int:
+        self._ensure_fd_no_transport(sock)
+        fut: asyncio.Future[int] = self.create_future()
+        fd = sock.fileno()
+        self.add_writer(fd, self._sock_sendto, fut, sock, data, address)
+        fut.add_done_callback(functools.partial(self._sock_write_done, fd))
+        return await fut
+
+    def _sock_sendto(  # pragma: no cover - datagram sends rarely block on loopback
+        self, fut: asyncio.Future[int], sock: socket.socket, data: Any, address: Any
+    ) -> None:
+        if fut.done():
+            return
+        try:
+            n = sock.sendto(data, 0, address)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(n)
+
+    async def sock_connect(self, sock: socket.socket, address: Any) -> None:
+        self._check_sock(sock)
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            infos = await self.getaddrinfo(*address[:2], family=sock.family, type=sock.type, proto=sock.proto)
+            _, _, _, _, address = infos[0]
+        fut: asyncio.Future[None] = self.create_future()
+        self._sock_connect_start(fut, sock, address)
+        return await fut
+
+    def _sock_connect_start(self, fut: asyncio.Future[None], sock: socket.socket, address: Any) -> None:
+        fd = sock.fileno()
         try:
             sock.connect(address)
-            return  # pragma: no cover - non-blocking TCP connect almost always defers
-        except BlockingIOError:
-            pass
-        future: asyncio.Future[None] = self.create_future()
+        except (BlockingIOError, InterruptedError):
+            self._ensure_fd_no_transport(sock)
+            self.add_writer(fd, self._sock_connect_cb, fut, sock, address)
+            fut.add_done_callback(functools.partial(self._sock_write_done, fd))
+        except (SystemExit, KeyboardInterrupt):  # pragma: no cover - parity with asyncio
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(None)
 
-        def _on_writable() -> None:
-            if future.done():  # may fire again before remove_writer takes effect
-                return
+    def _sock_connect_cb(self, fut: asyncio.Future[None], sock: socket.socket, address: Any) -> None:
+        if fut.done():  # pragma: no cover - cancellation races the writer
+            return
+        try:
             err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
             if err != 0:
-                future.set_exception(OSError(err, f"Connect call failed {address!r}"))
-            else:
-                future.set_result(None)
+                raise OSError(err, f"Connect call failed {address}")
+        except (BlockingIOError, InterruptedError):  # pragma: no cover - retried on next readiness
+            pass
+        except (SystemExit, KeyboardInterrupt):  # pragma: no cover - parity with asyncio
+            raise
+        except BaseException as exc:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(None)
 
-        self.add_writer(sock.fileno(), _on_writable)
+    async def sock_accept(self, sock: socket.socket) -> Any:
+        self._check_sock(sock)
+        fut: asyncio.Future[Any] = self.create_future()
+        self._sock_accept(fut, sock)
+        return await fut
+
+    def _sock_accept(self, fut: asyncio.Future[Any], sock: socket.socket) -> None:
+        fd = sock.fileno()
         try:
-            await future
-        finally:
-            self.remove_writer(sock.fileno())
+            conn, address = sock.accept()
+            conn.setblocking(False)
+        except (BlockingIOError, InterruptedError):
+            self._ensure_fd_no_transport(sock)
+            self.add_reader(fd, self._sock_accept, fut, sock)
+            fut.add_done_callback(functools.partial(self._sock_read_done, fd))
+        except (SystemExit, KeyboardInterrupt):  # pragma: no cover - parity with asyncio
+            raise
+        except BaseException as exc:  # pragma: no cover - accept errors are environment-specific
+            fut.set_exception(exc)
+        else:
+            fut.set_result((conn, address))
