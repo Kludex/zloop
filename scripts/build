@@ -8,8 +8,8 @@ set -x
 # exercise the reactor, timer heap, and ready queue without CPython.
 zig build test
 
-# Build the extension against the venv interpreter, then confirm it imports.
-./build_ext.sh "$(pwd)/.venv/bin/python"
+# Rebuild the extension through the hatch-ziglang hook, then confirm it imports.
+uv sync --frozen --reinstall-package zloop ${ZLOOP_SYNC_GROUPS:---all-groups}
 .venv/bin/python -c "import zloop; print(zloop.new_event_loop())"
 
 # Build the docs so a broken site fails CI before it ever ships. Skippable when

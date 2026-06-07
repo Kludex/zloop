@@ -22,9 +22,9 @@ pub fn build(b: *std.Build) void {
     // -D options or environment variables. Resolved lazily so the test step
     // above never requires a Python toolchain.
     const py_include = b.option([]const u8, "python-include", "Path to the CPython include dir") orelse
-        (b.graph.environ_map.get("ZLOOP_PYTHON_INCLUDE") orelse return);
+        (b.graph.environ_map.get("HATCH_ZIG_PYTHON_INCLUDE") orelse return);
     const ext_suffix = b.option([]const u8, "ext-suffix", "Extension module suffix") orelse
-        (b.graph.environ_map.get("ZLOOP_EXT_SUFFIX") orelse return);
+        (b.graph.environ_map.get("HATCH_ZIG_EXT_SUFFIX") orelse return);
 
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
