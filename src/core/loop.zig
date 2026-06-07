@@ -260,6 +260,12 @@ pub const Loop = struct {
         {
             self.xlock.lock();
             defer self.xlock.unlock();
+            // Check closed under the same lock that close()/drainXthread take, so
+            // a token is never stranded by racing close(): either we observe the
+            // close and reject (caller releases the token), or we append before
+            // close and drainXthread drops it. Without this, a free-threaded
+            // call_soon_threadsafe racing close() leaks the Handle.
+            if (self.closed) return error.LoopClosed;
             try self.xthread.append(self.allocator, token);
         }
         self.wakeup();
@@ -595,7 +601,13 @@ pub const Loop = struct {
 
     pub fn close(self: *Loop) void {
         if (self.closed) return;
-        self.closed = true;
+        // Publish `closed` under the xlock so a concurrent call_soon_threadsafe
+        // either sees it (and rejects) or has already appended (and we drain it).
+        {
+            self.xlock.lock();
+            defer self.xlock.unlock();
+            self.closed = true;
+        }
         // Drop pending callbacks/timers now (asyncio clears _ready/_scheduled on
         // close) so a closed loop with queued work can still be collected.
         self.dropPending();

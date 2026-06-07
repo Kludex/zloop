@@ -31,6 +31,9 @@ docs = [
     "zensical",
     "matplotlib",  # docs/gen_bench_chart.py renders the benchmark chart
 ]
+bench = [
+    "uvloop",  # the comparison baseline for bench_uvloop/bench_ci.py
+]
 
 [tool.hatch.version]
 source = "uv-dynamic-versioning"
@@ -71,6 +74,9 @@ archs = ["auto"]
 
 [tool.cibuildwheel.macos]
 archs = ["arm64", "x86_64"]
+# Pin the wheel tag's minimum macOS; hatch_build.py passes the same version to
+# Zig so the compiled `.so` and the tag agree and delocate accepts the wheel.
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [tool.pytest.ini_options]
 addopts = "-rxXs --strict-config --strict-markers"

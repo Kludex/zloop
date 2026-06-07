@@ -69,6 +69,13 @@ fn dispatchResume(_: *anyopaque, state: ?*anyopaque) void {
 
 fn cancelTimerHook(loop_obj: py.Object, token: usize, seq: u64) void {
     const self: *LoopObject = @ptrCast(loop_obj);
+    // Touching the timer heap is only safe on the loop's own thread - the loop
+    // thread mutates/reallocs it concurrently, and the GIL is dropped during the
+    // blocking wait. From another thread, skip the heap walk: the Handle's own
+    // `cancelled` flag (already set by cancel() before this hook) prevents the
+    // callback from running, so cross-thread cancel is still correct - it just
+    // forgoes the early ref release (the timer is dropped when it pops, cancelled).
+    if (self.thread_id != 0 and self.thread_id != currentThreadId()) return;
     if (self.engine) |eng| {
         if (eng.cancelTimer(token, seq)) {
             // The engine still holds the schedule ref; release it now.
@@ -524,8 +531,13 @@ const StopCallback = struct {
         .flags = c.Py_TPFLAGS_DEFAULT,
         .slots = &sc_slots,
     };
-    fn ensureType() bool {
+    /// Create the type eagerly at module init. Lazy creation would race under
+    /// free-threading (two threads' first run_until_complete both building it).
+    fn registerType() bool {
         if (sc_type == null) sc_type = py.typeFromSpec(&sc_spec);
+        return sc_type != null;
+    }
+    fn ensureType() bool {
         return sc_type != null;
     }
     fn create(loop_obj: py.Object) py.Object {
@@ -810,6 +822,15 @@ pub fn registerType(module: py.Object) bool {
     task_cls = py.importFrom("asyncio", "Task");
     ensure_future_fn = py.importFrom("asyncio", "ensure_future");
     if (future_cls == null or task_cls == null or ensure_future_fn == null) return false;
+
+    // Eager-init types/caches that would otherwise lazily initialise on first use
+    // and race under free-threading. Module init is serialized by CPython's
+    // import lock, so these one-time writes happen-before any later read.
+    if (!StopCallback.registerType()) return false;
+    const et = py.emptyTuple(); // prime empty_tuple_cache
+    if (et == null) return false;
+    py.decref(et);
+
     _ = module;
     return true;
 }

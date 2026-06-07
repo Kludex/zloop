@@ -2,7 +2,7 @@
 icon: simple/python
 ---
 
-# AsyncIO, AnyIO & Trio
+# AsyncIO & AnyIO
 
 zloop is an `asyncio.AbstractEventLoop`. Not "asyncio-like" - the real thing. So
 the asyncio APIs you reach for day to day - tasks, futures, timers, streams,
@@ -192,9 +192,8 @@ asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ## With AnyIO
 
 [AnyIO](https://anyio.readthedocs.io) is the structured-concurrency layer that
-sits on top of asyncio (and Trio). It's what Starlette, FastAPI, and HTTPX use
-internally - so making AnyIO run on zloop means a *lot* of the ecosystem runs on
-zloop.
+sits on top of asyncio. It's what Starlette, FastAPI, and HTTPX use internally -
+so making AnyIO run on zloop means a *lot* of the ecosystem runs on zloop.
 
 The good news: AnyIO's asyncio backend accepts a **loop factory**, so this is a
 clean one-liner.
@@ -261,45 +260,6 @@ async def test_runs_on_zloop():
     streams, tasks, and timers should pass unchanged; if a suite reaches for
     UDP, subprocesses, pipes, or the `sock_*` helpers it'll hit zloop's
     [unimplemented APIs](../reference/compatibility.md). 🙂
-
-## What about Trio?
-
-Short answer: **Trio code can't run on zloop directly, but Trio-style AnyIO code
-can.**
-
-[Trio](https://trio.readthedocs.io) is not built on asyncio - it has its **own**
-runtime and its own event loop. zloop is an `asyncio` loop, and an asyncio loop
-can only drive asyncio tasks, so there's no way to plug zloop into Trio's runner.
-Pure-Trio programs (`trio.run(...)`, `trio.open_nursery()`, Trio channels) keep
-using Trio's loop.
-
-What *does* work is code written against **AnyIO's** API. AnyIO gives you one
-structured-concurrency API (task groups, cancel scopes, streams) that runs on
-either backend - so the same AnyIO code runs on Trio *or* on asyncio, and when
-you pick the asyncio backend, it runs on zloop:
-
-```python title="anyio_on_zloop.py"
-import anyio
-
-import zloop
-
-
-async def main():
-    async with anyio.create_task_group() as tg:  # Trio-style structured concurrency
-        tg.start_soon(anyio.sleep, 0.1)
-    return "AnyIO code, asyncio backend, Zig loop ✨"
-
-
-# backend="trio" would use Trio's loop instead - and ignore zloop.
-print(anyio.run(main, backend="asyncio", backend_options={"loop_factory": zloop.new_event_loop}))
-```
-
-!!! note "Rule of thumb"
-    If your code imports `trio` and calls `trio.run`, it's on Trio's loop, not
-    zloop. If it imports `anyio` and you select the asyncio backend, it's on
-    zloop. The [`trio-asyncio`](https://trio-asyncio.readthedocs.io) bridge can
-    host an asyncio loop *inside* a Trio program, but that's a niche setup and not
-    something zloop targets.
 
 ## What about the low-level loop methods?
 

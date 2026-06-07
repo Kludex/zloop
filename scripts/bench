@@ -1,0 +1,10 @@
+#!/bin/sh -e
+
+# Run the echo benchmark (zloop vs uvloop vs asyncio) and print a Markdown table.
+# Needs the `bench` dependency group (uvloop) and a built extension.
+
+if [ -z "$GITHUB_ACTIONS" ]; then
+    set -x
+fi
+
+.venv/bin/python bench_uvloop/bench_ci.py "$@"
