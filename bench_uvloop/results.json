@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "num": 50000,
+    "workers": 3,
+    "best_of": 5,
+    "python": "3.13",
+    "loops": ["asyncio", "uvloop", "zloop"]
+  },
+  "rows": []
+}

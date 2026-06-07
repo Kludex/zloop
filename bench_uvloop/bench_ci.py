@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import subprocess
@@ -86,12 +87,13 @@ def run_cell(py: str, loop: str, mode: str, size: int, num: int, workers: int, p
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--loops", default="asyncio,uvloop,zloop")
-    ap.add_argument("--modes", default="proto,streams")
-    ap.add_argument("--sizes", default="1000,102400")
-    ap.add_argument("--num", type=int, default=30000)
+    ap.add_argument("--modes", default="proto,buffered,streams")
+    ap.add_argument("--sizes", default="1000,10240,102400")
+    ap.add_argument("--num", type=int, default=50000)
     ap.add_argument("--workers", type=int, default=3)
-    ap.add_argument("--best-of", type=int, default=3)
+    ap.add_argument("--best-of", type=int, default=5)
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--json", type=Path, default=None, help="also write results as JSON to this path")
     args = ap.parse_args()
 
     loops = [x for x in args.loops.split(",") if x]
@@ -112,6 +114,19 @@ def main() -> int:
                     time.sleep(0.2)
                 cell[loop] = best
             rows.append((mode, size, cell))
+
+    if args.json is not None:
+        payload = {
+            "meta": {
+                "num": args.num,
+                "workers": args.workers,
+                "best_of": args.best_of,
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "loops": loops,
+            },
+            "rows": [{"mode": mode, "size": size, "rps": cell} for mode, size, cell in rows],
+        }
+        args.json.write_text(json.dumps(payload, indent=2) + "\n")
 
     print(f"## Echo benchmark (requests/sec, best of {args.best_of})\n")
     print(

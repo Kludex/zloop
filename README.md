@@ -31,32 +31,59 @@ uvicorn app:app --loop zloop:new_event_loop
   **100%** coverage.
 - **Fast.** Faster than uvloop on the workloads measured so far - scheduling,
   timers, and small/medium-message socket throughput (e.g. `call_soon` +46%,
-  1 KiB echo +16% on CPython 3.14 / macOS arm64). `create_future` ties, because
-  all three loops reuse CPython's C-accelerated `_asyncio.Future`.
+  1 KiB buffered echo +6% on CPython 3.14 / macOS arm64). `create_future` ties,
+  because all three loops reuse CPython's C-accelerated `_asyncio.Future`.
 
-## Benchmarks
+## Performance
 
 The fairest comparison is uvloop's *own* echo benchmark, run unchanged except
 for a `--zloop` server flag mirroring `--uvloop` (the client is byte-for-byte
-uvloop's). Requests/sec, higher is better - macOS arm64, CPython 3.14, 3
-workers, best of 3:
+uvloop's). Requests/sec, higher is better.
 
-| Message | Server mode | asyncio | uvloop | zloop | zloop vs uvloop |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 1 KiB | proto | 113k | 113k | **121k** | **+7%** |
-| 1 KiB | buffered | 115k | 115k | **123k** | **+7%** |
-| 1 KiB | streams | 83k | 90k | **103k** | **+14%** |
-| 10 KiB | proto | 105k | 110k | **113k** | **+3%** |
-| 10 KiB | buffered | 105k | 105k | **124k** | **+18%** |
-| 10 KiB | streams | 81k | 86k | **95k** | **+11%** |
+zloop has two backends: the default readiness reactor (epoll/kqueue) and an
+opt-in io_uring **completion** backend (`ZLOOP_IO_URING=completion`, Linux only).
+Both are shown below; the **fastest** in each row is bold.
 
-For the 1-10 KiB messages common in HTTP, WebSocket frames, and RPC, zloop leads
-uvloop in every cell. The 100 KiB row is omitted: at that size the test measures
-loopback bandwidth, not the loop, and all three swing wildly run-to-run.
+### Single loop (the default, GIL on)
 
-Reproduce it with `scripts/bench` (or `bash bench_uvloop/run_matrix.sh` for the
-full matrix); the **Benchmark** CI workflow runs it on Linux and posts the table
-to the run summary.
+Linux, CPython 3.14, 3 workers, best of 3, requests/sec:
+
+![Echo throughput: uvloop vs zloop across server modes and message sizes](https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/echo-bench.svg)
+
+| mode    | size    | asyncio | uvloop  | zloop epoll | zloop io_uring |
+| ------- | ------: | ------: | ------: | ----------: | -------------: |
+| proto   | 1 KB    | 135,393 | 127,872 |     132,223 |    **138,778** |
+| proto   | 100 KiB |  61,441 |  57,158 |  **66,188** |         22,280 |
+| streams | 1 KB    | 105,250 | 116,043 | **122,236** |        116,720 |
+| streams | 100 KiB |  43,312 |  40,582 |  **46,862** |         19,679 |
+
+For a single GIL-bound loop the **default epoll backend beats uvloop**. The
+io_uring completion backend is *slower* here - its submit/reap overhead and the
+64 KiB buffer-ring copy aren't amortized when one serialized loop is the
+bottleneck (it fragments 100 KiB messages badly). Completion's win is parallel
+free-threaded loops, below.
+
+### Free-threaded parallel loops (GIL off)
+
+Under free-threaded CPython (3.14t), N independent loops on N threads stop being
+serialized by the GIL - and the leaner completion path (batched submits,
+multishot recv, ring writes, cached `data_received`) **beats uvloop at every
+thread count**. 1 KB messages, 8 conns/thread, requests/sec:
+
+| loops | uvloop    | zloop epoll | zloop io_uring |
+| ----: | --------: | ----------: | -------------: |
+|     1 |   174,185 |     163,900 |    **209,071** |
+|     4 |   606,261 |     535,556 |    **742,847** |
+|     8 |   934,289 |     783,205 |  **1,142,655** |
+|    16 | 1,148,609 |     815,971 |  **1,182,234** |
+
+_(Linux io_uring kernel 6.10, 3-sample medians on a 12-CPU host; directional -
+measured in a VM, not bare metal. The 16-loop margin is thin: 16 loops
+oversubscribe 12 cores.)_
+
+Reproduce the single-loop matrix with `scripts/bench`; the free-threaded numbers
+come from `bench_uvloop/ft_parallel_bench.py` on a `python3.14t` build. Full
+tables and caveats are in [the performance docs](https://zloop.marcelotryle.com/reference/performance/).
 
 ## How it works
 
