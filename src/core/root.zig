@@ -17,4 +17,5 @@ test {
     _ = clock;
     _ = loop;
     if (builtin.os.tag == .linux) _ = @import("uring.zig");
+    if (builtin.os.tag == .linux) _ = @import("completor.zig");
 }
