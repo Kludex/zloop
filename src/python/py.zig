@@ -7,6 +7,12 @@ const std = @import("std");
 
 pub const c = @cImport({
     @cDefine("PY_SSIZE_T_CLEAN", "1");
+    // Free-threaded headers pick the atomic backend by compiler macro. Zig's
+    // translate-c doesn't always present as __clang__/__GNUC__, so Python.h falls
+    // to pyatomic_std.h, whose functions are extern (not header-only) and go
+    // unresolved at dlopen. clang has the GCC atomic builtins, so force the
+    // header-only pyatomic_gcc.h path - correct on every build, required on 3.x t.
+    @cDefine("_Py_USE_GCC_BUILTIN_ATOMICS", "1");
     @cInclude("Python.h");
 });
 

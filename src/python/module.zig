@@ -31,6 +31,15 @@ fn PyInit__zloop() callconv(.c) ?*c.PyObject {
     const m = c.PyModule_Create(&module_def);
     if (m == null) return null;
 
+    // Declare free-threading support so importing on a free-threaded build does
+    // not force the GIL back on. Available only on free-threaded CPython.
+    // NOTE: zloop's known free-threading races (lazy sc_type/empty_tuple init,
+    // call_soon_threadsafe vs close, cross-thread timer cancel) are NOT yet
+    // fixed - this is for benchmarking parallel loops, not production.
+    if (@hasDecl(c, "PyUnstable_Module_SetGIL")) {
+        _ = c.PyUnstable_Module_SetGIL(m, c.Py_MOD_GIL_NOT_USED);
+    }
+
     if (!handle.registerTypes(m)) {
         py.decref(m);
         return null;
