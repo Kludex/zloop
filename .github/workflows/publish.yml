@@ -118,12 +118,12 @@ jobs:
           pattern: "{wheels-*,sdist}"
           merge-multiple: true
 
-      - name: Publish to TestPyPI
-        # Docker action: GHCR tags released versions, not commit SHAs, so a SHA
-        # pin fails with `manifest unknown`. Pin to the published version tag.
-        uses: pypa/gh-action-pypi-publish@v1.14.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          repository-url: https://test.pypi.org/legacy/
+          enable-cache: false
+
+      - name: Publish to TestPyPI
+        run: uv publish --trusted-publishing always --publish-url https://test.pypi.org/legacy/
 
   publish:
     name: Publish to PyPI
@@ -146,7 +146,9 @@ jobs:
           pattern: "{wheels-*,sdist}"
           merge-multiple: true
 
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: false
+
       - name: Publish to PyPI
-        # Docker action: GHCR tags released versions, not commit SHAs, so a SHA
-        # pin fails with `manifest unknown`. Pin to the published version tag.
-        uses: pypa/gh-action-pypi-publish@v1.14.0
+        run: uv publish --trusted-publishing always

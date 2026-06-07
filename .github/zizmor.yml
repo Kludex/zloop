@@ -1,9 +1,0 @@
-rules:
-  unpinned-uses:
-    config:
-      policies:
-        # Docker action: GHCR tags released versions, not commit SHAs, so a SHA
-        # pin fails the image pull with `manifest unknown`. Allow the immutable
-        # version tag (v1.14.0), which GHCR does publish an image for.
-        pypa/gh-action-pypi-publish: ref-pin
-        "*": hash-pin
