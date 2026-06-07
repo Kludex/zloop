@@ -18,9 +18,6 @@ icon: lucide/zap
 
 ---
 
-!!! warning "Experimental"
-    zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
-
 zloop is an [asyncio](https://docs.python.org/3/library/asyncio.html) event loop whose
 engine is written in [Zig](https://ziglang.org). It is to asyncio what
 [uvloop](https://github.com/MagicStack/uvloop) is: a **drop-in replacement** for the
@@ -44,6 +41,9 @@ The key features are:
   [FastAPI](usage/servers.md#fastapi-starlette)) just pick it up.
 * **Tested**: it passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
   test suite, plus its own suite at 100% coverage.
+
+!!! warning "Experimental"
+    zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
 ## Installation
 
