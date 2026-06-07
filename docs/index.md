@@ -5,19 +5,18 @@ icon: lucide/zap
 # zloop
 
 <p align="center">
-    <em>An asyncio event loop with a Zig core - a drop-in, faster-than-uvloop alternative.</em>
+    <img src="assets/logo.png" alt="zloop" width="320">
+</p>
+
+<p align="center">
+    <em>An asyncio event loop with a Zig core! ⚡</em>
 </p>
 
 ---
 
-**Documentation**: you are reading it 🙂
-
 **Source Code**: <a href="https://github.com/Kludex/zloop" target="_blank">https://github.com/Kludex/zloop</a>
 
 ---
-
-!!! warning "Experimental"
-    zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
 zloop is an [asyncio](https://docs.python.org/3/library/asyncio.html) event loop whose
 engine is written in [Zig](https://ziglang.org). It is to asyncio what
@@ -42,6 +41,9 @@ The key features are:
   [FastAPI](usage/servers.md#fastapi-starlette)) just pick it up.
 * **Tested**: it passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
   test suite, plus its own suite at 100% coverage.
+
+!!! warning "Experimental"
+    zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
 ## Installation
 

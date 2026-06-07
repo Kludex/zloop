@@ -1,5 +1,9 @@
 # zloop
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/logo.png" alt="zloop" width="320">
+</p>
+
 > [!WARNING]
 > zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
