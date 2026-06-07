@@ -1,9 +1,10 @@
-"""Render the echo benchmark results into the chart and the README/docs tables.
+"""Render the single-loop echo benchmark chart from results.json.
 
 Single source of truth: bench_uvloop/results.json (written by bench_ci.py --json).
-Regenerates docs/assets/echo-bench.svg and splices the Markdown table between the
-`<!-- BENCH:START -->` / `<!-- BENCH:END -->` markers in README.md and the docs
-performance page.
+Regenerates the docs/assets/echo-bench.svg chart (uvloop vs zloop, single loop).
+The README/docs Markdown tables are curated by hand because they also cover the
+io_uring completion backend and the free-threaded results, which this single-loop
+pipeline does not measure.
 
 Run: python docs/render_bench.py
 """
@@ -11,7 +12,6 @@ Run: python docs/render_bench.py
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import matplotlib
@@ -22,11 +22,6 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "bench_uvloop" / "results.json"
 CHART = ROOT / "docs" / "assets" / "echo-bench.svg"
-README = ROOT / "README.md"
-DOCS_PERF = ROOT / "docs" / "reference" / "performance.md"
-
-START = "<!-- BENCH:START -->"
-END = "<!-- BENCH:END -->"
 
 UVLOOP_C = "#9fa8da"  # muted indigo
 ZLOOP_C = "#ffb300"  # amber
@@ -40,10 +35,6 @@ def _size_kib(size: int) -> int:
 
 def _bar_label(mode: str, size: int) -> str:
     return f"{_MODE_SHORT.get(mode, mode)} {_size_kib(size)}K"
-
-
-def _k(rps: float) -> str:
-    return f"{rps / 1000:.0f}k"
 
 
 def render_chart(rows: list[dict]) -> None:
@@ -82,49 +73,13 @@ def render_chart(rows: list[dict]) -> None:
     print(f"wrote {CHART.relative_to(ROOT)}")
 
 
-def render_table(rows: list[dict], loops: list[str]) -> str:
-    lines = [
-        "| Message | Server mode | " + " | ".join(loops) + " | zloop vs uvloop |",
-        "| --- | --- | " + " | ".join(["---:"] * len(loops)) + " | ---: |",
-    ]
-    for r in rows:
-        rps = r["rps"]
-        best = max((rps.get(loop, 0) for loop in loops), default=0)
-        cells = []
-        for loop in loops:
-            v = rps.get(loop, 0)
-            cell = _k(v)
-            cells.append(f"**{cell}**" if v == best and v else cell)
-        delta = ""
-        if rps.get("uvloop"):
-            pct = round((rps.get("zloop", 0) / rps["uvloop"] - 1) * 100)
-            sign = "+" if pct > 0 else ""
-            delta = f"**{sign}{pct}%**" if pct > 0 else f"{sign}{pct}%"
-        msg = f"{_size_kib(r['size'])} KiB"
-        lines.append(f"| {msg} | {r['mode']} | " + " | ".join(cells) + f" | {delta} |")
-    return "\n".join(lines)
-
-
-def splice(path: Path, table: str) -> None:
-    text = path.read_text()
-    pattern = re.compile(re.escape(START) + r".*?" + re.escape(END), re.DOTALL)
-    if not pattern.search(text):
-        raise RuntimeError(f"{path.relative_to(ROOT)} has no {START} / {END} markers")
-    path.write_text(pattern.sub(f"{START}\n{table}\n{END}", text))
-    print(f"spliced table into {path.relative_to(ROOT)}")
-
-
 def main() -> int:
     data = json.loads(RESULTS.read_text())
     rows = data["rows"]
-    loops = data["meta"]["loops"]
     if not rows:
-        print("results.json has no rows yet; leaving the BENCH placeholders in place")
+        print("results.json has no rows yet; nothing to chart")
         return 0
     render_chart(rows)
-    table = render_table(rows, loops)
-    splice(README, table)
-    splice(DOCS_PERF, table)
     return 0
 
 

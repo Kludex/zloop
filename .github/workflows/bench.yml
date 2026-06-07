@@ -2,15 +2,10 @@ name: Benchmark
 
 on:
   workflow_dispatch:
+  # Run only on main, where the regenerated numbers are actually consumed (the
+  # update-readme job opens the numbers PR). Running on PRs just burned CI minutes
+  # on results that were thrown away.
   push:
-    branches: ["main"]
-    paths:
-      - "bench_uvloop/**"
-      - "src/**"
-      - "zloop/**"
-      - "docs/render_bench.py"
-      - ".github/workflows/bench.yml"
-  pull_request:
     branches: ["main"]
     paths:
       - "bench_uvloop/**"
@@ -54,10 +49,9 @@ jobs:
           name: bench-results
           path: bench_uvloop/results.json
 
-  update-readme:
-    name: Open README update PR
+  update-chart:
+    name: Open benchmark chart PR
     needs: bench
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write # commit the regenerated files
@@ -77,7 +71,7 @@ jobs:
           python-version: "3.13"
           enable-cache: false
 
-      - name: Render chart and tables from results
+      - name: Render the chart from results
         run: uv run --with matplotlib python docs/render_bench.py
 
       - name: Open or update the benchmark PR
@@ -85,15 +79,15 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: bench/update-numbers
-          commit-message: "Update benchmark numbers from CI"
-          title: "Update benchmark numbers"
+          commit-message: "Update benchmark chart from CI"
+          title: "Update benchmark chart"
           body: |
-            Regenerated `docs/assets/echo-bench.svg`, the README table, and the
-            docs performance table from the latest CI echo benchmark.
+            Regenerated `docs/assets/echo-bench.svg` from the latest CI echo
+            benchmark. The README and docs performance tables are curated by hand
+            (they also cover the io_uring and free-threaded results, which this
+            single-loop run does not measure).
 
             Source of truth: `bench_uvloop/results.json`.
           add-paths: |
-            README.md
-            docs/reference/performance.md
             docs/assets/echo-bench.svg
             bench_uvloop/results.json
