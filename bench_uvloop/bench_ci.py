@@ -86,11 +86,11 @@ def run_cell(py: str, loop: str, mode: str, size: int, num: int, workers: int, p
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--loops", default="asyncio,uvloop,zloop")
-    ap.add_argument("--modes", default="proto,streams")
-    ap.add_argument("--sizes", default="1000,102400")
-    ap.add_argument("--num", type=int, default=30000)
+    ap.add_argument("--modes", default="proto,buffered,streams")
+    ap.add_argument("--sizes", default="1000,10240,102400")
+    ap.add_argument("--num", type=int, default=50000)
     ap.add_argument("--workers", type=int, default=3)
-    ap.add_argument("--best-of", type=int, default=3)
+    ap.add_argument("--best-of", type=int, default=5)
     ap.add_argument("--python", default=sys.executable)
     args = ap.parse_args()
 
