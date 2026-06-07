@@ -88,9 +88,14 @@ fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
     return callUnderContext(st, m, arg);
 }
 
-/// Like protoCall1 but with an already-resolved (borrowed) callable - used by the
-/// read hot path with the cached data_received to skip the per-message lookup.
+/// Like protoCall1 but with an already-resolved callable - used by the read hot
+/// path with the cached data_received to skip the per-message lookup. Holds a
+/// strong ref across the call: data_received may reentrantly set_protocol or
+/// close the transport, which clears the cache and could otherwise free the
+/// in-flight method out from under us.
 fn protoCallCached(st: *State, m: py.Object, arg: py.Object) py.Object {
+    py.incref(m);
+    defer py.decref(m);
     return callUnderContext(st, m, arg);
 }
 

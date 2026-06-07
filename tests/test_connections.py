@@ -395,3 +395,31 @@ def test_set_protocol_reroutes_data_received(loop: asyncio.AbstractEventLoop) ->
         await server.wait_closed()
 
     run(loop, main())
+
+
+def test_set_protocol_from_within_data_received(loop: asyncio.AbstractEventLoop) -> None:
+    # Reentrant rebind: data_received swaps the protocol mid-callback, which clears
+    # the transport's cached bound data_received. The in-flight call holds its own
+    # reference so the method is not freed under itself (a latent UAF the cached
+    # path would otherwise risk; deterministic only under a sanitizer build).
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+        done: asyncio.Future[None] = loop.create_future()
+
+        class Swapper(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                self.transport = transport
+
+            def data_received(self, data: bytes) -> None:
+                self.transport.set_protocol(asyncio.Protocol())  # clears the cache
+                if not done.done():
+                    done.set_result(None)
+
+        transport, _ = await loop.create_connection(Swapper, host, port)
+        transport.write(b"trigger")
+        await asyncio.wait_for(done, 2.0)
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    run(loop, main())
