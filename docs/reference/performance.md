@@ -24,12 +24,15 @@ Results (macOS arm64, CPython 3.14, 3 workers, best of 3), requests/sec:
 
 | Message | Server mode | asyncio | uvloop | zloop | zloop vs uvloop |
 | --- | --- | ---: | ---: | ---: | ---: |
-| **1 KiB** | proto | 113k | 113k | **121k** | **+7%** |
-| **1 KiB** | buffered | 115k | 115k | **123k** | **+7%** |
-| **1 KiB** | streams | 83k | 90k | **103k** | **+14%** |
-| **10 KiB** | proto | 105k | 110k | **113k** | **+3%** |
-| **10 KiB** | buffered | 105k | 105k | **124k** | **+18%** |
-| **10 KiB** | streams | 81k | 86k | **95k** | **+11%** |
+| **1 KiB** | proto | 112k | 114k | **117k** | **+2%** |
+| **1 KiB** | buffered | 112k | 114k | **121k** | **+6%** |
+| **1 KiB** | streams | 84k | 93k | **95k** | **+2%** |
+| **10 KiB** | proto | 105k | **116k** | 115k | -1% |
+| **10 KiB** | buffered | 106k | 109k | **119k** | **+9%** |
+| **10 KiB** | streams | 83k | 89k | **90k** | **+1%** |
+| **100 KiB** | proto | **56k** | 55k | 52k | -4% |
+| **100 KiB** | buffered | 53k | **56k** | 55k | -1% |
+| **100 KiB** | streams | 40k | 43k | **44k** | **+2%** |
 
 <figure markdown="span">
   ![Echo throughput: uvloop vs zloop across server modes and message sizes](../assets/echo-bench.svg){ width="720" }
@@ -38,16 +41,16 @@ Results (macOS arm64, CPython 3.14, 3 workers, best of 3), requests/sec:
 </figure>
 
 For the small-to-medium messages common in HTTP requests, WebSocket frames, and
-RPC calls (1 to 10 KiB), **zloop is ahead of uvloop in every cell measured**,
-with the biggest, most reproducible margins on the `streams` and `buffered`
-paths.
+RPC calls (1 to 10 KiB), **zloop edges out uvloop in nearly every cell**, with
+the most reproducible margin on the `buffered` path.
 
 !!! warning "About large (100 KiB) messages"
-    uvloop's benchmark also has a 100 KiB row. We don't report a winner there:
-    at that size the test measures *loopback bandwidth*, not the event loop, and
-    the numbers swing wildly between runs for all three loops (we saw asyncio's
-    streams read 42k one run and 24k the next). To measure large-message
-    behavior meaningfully you need real hardware, not loopback.
+    At 100 KiB the three loops converge - zloop, uvloop, and even asyncio land
+    within a few percent of each other. At that size the test measures *loopback
+    bandwidth*, not the event loop, and the numbers swing run-to-run (we saw
+    asyncio's streams read 42k one run and 24k the next). The row is included for
+    completeness, but to measure large-message behavior meaningfully you need
+    real hardware, not loopback.
 
 ### Reproduce it
 

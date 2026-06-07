@@ -28,28 +28,33 @@ uvicorn app:app --loop zloop:new_event_loop
   **100%** coverage.
 - **Fast.** Faster than uvloop on the workloads measured so far - scheduling,
   timers, and small/medium-message socket throughput (e.g. `call_soon` +46%,
-  1 KiB echo +16% on CPython 3.14 / macOS arm64). `create_future` ties, because
-  all three loops reuse CPython's C-accelerated `_asyncio.Future`.
+  1 KiB buffered echo +6% on CPython 3.14 / macOS arm64). `create_future` ties,
+  because all three loops reuse CPython's C-accelerated `_asyncio.Future`.
 
-## Benchmarks
+## Performance
 
 The fairest comparison is uvloop's *own* echo benchmark, run unchanged except
 for a `--zloop` server flag mirroring `--uvloop` (the client is byte-for-byte
 uvloop's). Requests/sec, higher is better - macOS arm64, CPython 3.14, 3
 workers, best of 3:
 
+![Echo throughput: uvloop vs zloop across server modes and message sizes](https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/echo-bench.svg)
+
 | Message | Server mode | asyncio | uvloop | zloop | zloop vs uvloop |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 1 KiB | proto | 113k | 113k | **121k** | **+7%** |
-| 1 KiB | buffered | 115k | 115k | **123k** | **+7%** |
-| 1 KiB | streams | 83k | 90k | **103k** | **+14%** |
-| 10 KiB | proto | 105k | 110k | **113k** | **+3%** |
-| 10 KiB | buffered | 105k | 105k | **124k** | **+18%** |
-| 10 KiB | streams | 81k | 86k | **95k** | **+11%** |
+| 1 KiB | proto | 112k | 114k | **117k** | **+2%** |
+| 1 KiB | buffered | 112k | 114k | **121k** | **+6%** |
+| 1 KiB | streams | 84k | 93k | **95k** | **+2%** |
+| 10 KiB | proto | 105k | **116k** | 115k | -1% |
+| 10 KiB | buffered | 106k | 109k | **119k** | **+9%** |
+| 10 KiB | streams | 83k | 89k | **90k** | **+1%** |
+| 100 KiB | proto | **56k** | 55k | 52k | -4% |
+| 100 KiB | buffered | 53k | **56k** | 55k | -1% |
+| 100 KiB | streams | 40k | 43k | **44k** | **+2%** |
 
-For the 1-10 KiB messages common in HTTP, WebSocket frames, and RPC, zloop leads
-uvloop in every cell. The 100 KiB row is omitted: at that size the test measures
-loopback bandwidth, not the loop, and all three swing wildly run-to-run.
+For the 1-10 KiB messages common in HTTP, WebSocket frames, and RPC, zloop edges
+out uvloop in nearly every cell. At 100 KiB the three loops converge: that size
+measures loopback bandwidth, not the loop, and the numbers swing run-to-run.
 
 Reproduce it with `scripts/bench` (or `bash bench_uvloop/run_matrix.sh` for the
 full matrix); the **Benchmark** CI workflow runs it on Linux and posts the table
