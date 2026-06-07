@@ -358,3 +358,40 @@ def test_pause_resume_reading(loop: asyncio.AbstractEventLoop) -> None:
         await server.wait_closed()
 
     run(loop, main())
+
+
+def test_set_protocol_reroutes_data_received(loop: asyncio.AbstractEventLoop) -> None:
+    # The transport caches the bound data_received; set_protocol must rebind it so
+    # data goes to the new protocol, not the original one.
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+
+        first: list[bytes] = []
+        second: list[bytes] = []
+        got: asyncio.Future[None] = loop.create_future()
+
+        class First(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                self.transport = transport
+
+            def data_received(self, data: bytes) -> None:
+                first.append(data)
+
+        class Second(asyncio.Protocol):
+            def data_received(self, data: bytes) -> None:
+                second.append(data)
+                if not got.done():
+                    got.set_result(None)
+
+        transport, proto = await loop.create_connection(First, host, port)
+        transport.set_protocol(Second())
+        transport.write(b"after-swap")
+        await asyncio.wait_for(got, 2.0)
+
+        assert b"".join(second) == b"after-swap"
+        assert first == []  # the original protocol must not receive post-swap data
+        transport.close()
+        server.close()
+        await server.wait_closed()
+
+    run(loop, main())

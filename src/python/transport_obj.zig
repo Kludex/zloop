@@ -32,6 +32,11 @@ const State = struct {
     loop_obj: py.Object, // owned - keeps the Loop (and its `engine`) alive
     engine: *core.Loop,
     protocol: py.Object, // owned
+    /// Bound protocol.data_received, cached at creation/set_protocol so the read
+    /// hot path skips a per-message attribute lookup (a typed dict/MRO walk that
+    /// takes per-object locks and contends across free-threaded loops). Owned;
+    /// null when the protocol has no data_received (rebuilt on set_protocol).
+    data_received: py.Object = null,
     self_obj: py.Object, // borrowed back-pointer for callbacks
     extra: py.Object, // dict of get_extra_info data (owned)
     /// The Python socket object that owns this fd, if any (owned). Closing it
@@ -80,6 +85,26 @@ fn protoCall1(st: *State, method_name: [*c]const u8, arg: py.Object) py.Object {
     const m = py.getAttr(st.protocol, method_name);
     if (m == null) return null;
     defer py.decref(m);
+    return callUnderContext(st, m, arg);
+}
+
+/// Like protoCall1 but with an already-resolved (borrowed) callable - used by the
+/// read hot path with the cached data_received to skip the per-message lookup.
+fn protoCallCached(st: *State, m: py.Object, arg: py.Object) py.Object {
+    return callUnderContext(st, m, arg);
+}
+
+/// Deliver `data` to protocol.data_received via the cached bound method (hot
+/// path), falling back to a lookup if the cache is empty. Returns a new ref or
+/// null with PyErr set.
+fn callDataReceived(st: *State, data: py.Object) py.Object {
+    if (st.data_received) |m| return protoCallCached(st, m, data);
+    return protoCall1(st, "data_received", data);
+}
+
+/// Invoke borrowed callable `m` with `arg` under the connection's captured
+/// context. Returns a new ref or null with PyErr set.
+fn callUnderContext(st: *State, m: py.Object, arg: py.Object) py.Object {
     if (st.context == null or py.isNone(st.context)) return py.callOneArg(m, arg);
     // Run under the connection's context via the raw C-API (no context.run
     // attribute lookup), preserving the callback's exception across the exit.
@@ -142,6 +167,7 @@ pub fn create(engine: *core.Loop, loop_obj: py.Object, fd: sys.fd_t, protocol: p
     // A BufferedProtocol (get_buffer/buffer_updated) takes the zero-copy read
     // path; SSLProtocol is one.
     st.buffered = py.hasAttr(protocol, "get_buffer");
+    cacheProtocolMethods(st);
     // Capture the current context so protocol callbacks (and the create_task
     // they make) inherit contextvars set by the caller.
     st.context = captureContext();
@@ -200,6 +226,7 @@ fn callLoopHook(st: *State, name: [*c]const u8) void {
 
 fn destroyState(st: *State) void {
     py.xdecref(st.protocol);
+    py.xdecref(st.data_received);
     py.xdecref(st.extra);
     py.xdecref(st.sock_obj);
     py.xdecref(st.context);
@@ -207,6 +234,21 @@ fn destroyState(st: *State) void {
     st.write_buf.deinit(gpa);
     st.send_buf.deinit(gpa);
     gpa.destroy(st);
+}
+
+/// Cache the bound protocol methods used on the hot path so each message skips an
+/// attribute lookup. Re-run whenever the protocol changes (set_protocol). Clears
+/// any prior cache first. A missing data_received leaves the cache null and the
+/// read path falls back to a per-message lookup.
+fn cacheProtocolMethods(st: *State) void {
+    py.clear(&st.data_received);
+    if (st.protocol == null) return;
+    const m = py.getAttr(st.protocol, "data_received");
+    if (m == null) {
+        py.c.PyErr_Clear();
+        return;
+    }
+    st.data_received = m; // owned
 }
 
 fn captureContext() py.Object {
@@ -355,7 +397,7 @@ fn deliverData(st: *State) void {
             }
         }
 
-        const r = protoCall1(st, "data_received", data);
+        const r = callDataReceived(st, data);
         py.decref(data);
         if (r == null) {
             reportProtocolError(st, "data_received");
@@ -427,7 +469,7 @@ fn readCompleted(st: *State, res: core.IoResult) void {
     if (data == null) {
         py.c.PyErr_Clear();
     } else {
-        const r = protoCall1(st, "data_received", data);
+        const r = callDataReceived(st, data);
         py.decref(data);
         if (r == null) {
             reportProtocolError(st, "data_received");
@@ -710,6 +752,7 @@ fn t_deliver_connection_lost(self_obj: ?*c.PyObject, exc: ?*c.PyObject) callconv
             py.c.PyErr_Clear();
         }
         py.clear(&st.protocol);
+        py.clear(&st.data_received);
     }
     // The loop no longer needs to keep this connection alive. Do this last: it
     // may drop the final reference and trigger dealloc.
@@ -773,6 +816,7 @@ fn t_traverse(self_obj: ?*c.PyObject, visit: c.visitproc, arg: ?*anyopaque) call
     if (t.dict != null) if (visit.?(t.dict, arg) != 0) return -1;
     if (t.state) |st| {
         if (st.protocol != null) if (visit.?(st.protocol, arg) != 0) return -1;
+        if (st.data_received != null) if (visit.?(st.data_received, arg) != 0) return -1;
         if (st.extra != null) if (visit.?(st.extra, arg) != 0) return -1;
         if (st.sock_obj != null) if (visit.?(st.sock_obj, arg) != 0) return -1;
         if (st.context != null) if (visit.?(st.context, arg) != 0) return -1;
@@ -795,6 +839,7 @@ fn t_clear(self_obj: ?*c.PyObject) callconv(.c) c_int {
             st.conn_lost = true;
         }
         py.clear(&st.protocol);
+        py.clear(&st.data_received);
         py.clear(&st.extra);
         py.clear(&st.sock_obj);
         py.clear(&st.context);
@@ -919,6 +964,7 @@ fn t_set_protocol(self_obj: ?*c.PyObject, proto: ?*c.PyObject) callconv(.c) py.O
     const st = stateOf(self_obj) orelse return py.none();
     py.clear(&st.protocol);
     st.protocol = py.newRef(proto.?);
+    cacheProtocolMethods(st); // rebind the cached data_received for the new protocol
     return py.none();
 }
 
