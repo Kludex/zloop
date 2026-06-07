@@ -9,7 +9,7 @@ icon: lucide/zap
 </p>
 
 <p align="center">
-    <em>An asyncio event loop with a Zig core! :zap:</em>
+    <em>An asyncio event loop with a Zig core! ⚡</em>
 </p>
 
 ---
