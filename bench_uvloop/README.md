@@ -50,17 +50,17 @@ against each other and against uvloop/asyncio. `num=30000` msgs/worker,
 
 ### Single loop (GIL on, CPython 3.14)
 
-| mode    | size    | asyncio | uvloop  | zloop (epoll) | zloop (io_uring) | epoll vs uvloop |
-| ------- | ------: | ------: | ------: | ------------: | ---------------: | --------------: |
-| proto   | 1 KB    | 139,888 | 133,536 |   **143,592** |           75,653 | **+7.5%**       |
-| proto   | 100 KiB |  61,691 |  58,206 |        57,641 |           21,090 | -1.0%           |
-| streams | 1 KB    |  94,972 |  73,588 |   **130,618** |           85,476 | **+77.5%**      |
-| streams | 100 KiB |  42,578 |  40,188 |    **47,062** |           18,236 | **+17.1%**      |
+| mode    | size    | asyncio | uvloop  | zloop (epoll) | epoll vs uvloop |
+| ------- | ------: | ------: | ------: | ------------: | --------------: |
+| proto   | 1 KB    | 139,888 | 133,536 |   **143,592** | **+7.5%**       |
+| proto   | 100 KiB |  61,691 |  58,206 |        57,641 | -1.0%           |
+| streams | 1 KB    |  94,972 |  73,588 |   **130,618** | **+77.5%**      |
+| streams | 100 KiB |  42,578 |  40,188 |    **47,062** | **+17.1%**      |
 
-For a single GIL-bound loop, the **default epoll backend beats uvloop** and the
-**io_uring completion backend is slower** - its submit/reap overhead and the
-buffer-ring copy aren't amortized when one GIL-serialized loop is the bottleneck.
-Completion is not for this case (see below).
+For a single GIL-bound loop the **default epoll backend beats uvloop**. The io_uring
+completion backend is *slower* here - its submit/reap overhead and the buffer-ring
+copy aren't amortized when one GIL-serialized loop is the bottleneck - so completion
+is not for this case; its win is parallel free-threaded loops (below).
 
 ### Free-threaded parallel loops (GIL off, CPython 3.14t)
 
@@ -68,25 +68,29 @@ N independent loops on N threads, 8 conns/thread, 1 KB messages, 2s each, 3-samp
 medians (12-CPU host). uvloop runs here too: it imports on 3.14t without forcing
 the GIL back on and drives one loop per thread fine.
 
-| threads | zloop epoll | zloop io_uring | uvloop    | completion vs uvloop |
-| ------: | ----------: | -------------: | --------: | -------------------: |
-|       1 |     157,684 |        199,489 |   173,537 | **+15.0%**           |
-|       2 |     272,095 |        358,838 |   321,936 | **+11.5%**           |
-|       4 |     480,934 |        629,977 |   607,786 | **+3.7%**            |
-|       8 |     647,740 |        917,239 | 1,029,682 | -10.9%               |
-|      16 |     726,142 |      1,089,033 | 1,268,657 | -14.2%               |
+| threads | zloop io_uring | uvloop    | io_uring vs uvloop |
+| ------: | -------------: | --------: | -----------------: |
+|       1 |        207,218 |   174,300 | **+18.9%**         |
+|       4 |        748,517 |   597,027 | **+25.4%**         |
+|       8 |      1,306,847 | 1,066,079 | **+22.6%**         |
+|      16 |      1,363,704 | 1,326,401 | **+2.8%**          |
 
-The completion backend (`ZLOOP_IO_URING=completion`) **beats uvloop at 1-4 parallel
-free-threaded loops** and beats zloop's own epoll default everywhere. The wins come
-from making the io_uring path lean: batched submits (one `io_uring_enter` per loop
-turn, not per op), multishot recv, and completion-path writes (SEND on the ring, no
-per-message `write()` syscall) - together they cut a busy single loop from ~17.7k to
-~3.6k enters and drop write syscalls to zero.
+The completion backend (`ZLOOP_IO_URING=completion`) **beats uvloop at every thread
+count**, and beats zloop's own epoll default everywhere. The wins come from keeping
+the io_uring path lean:
 
-Past ~8 loops on this 12-CPU host the workload is oversubscribed and the bottleneck
-moves from syscall efficiency to CPU-per-request, where uvloop's mature hot path
-still leads; closing that means cutting per-request CPU (e.g. the per-recv PyBytes
-copy), not more io_uring tuning.
+- **batched submits** - one `io_uring_enter` per loop turn, not per op;
+- **multishot recv** - the kernel keeps the recv armed, no per-message re-arm;
+- **completion-path writes** - SEND on the ring, no per-message `write()` syscall;
+- **cached `data_received`** - a per-message attribute lookup was taking per-object
+  locks and causing a `sched_yield` storm across parallel free-threaded loops
+  (~135k yields at 16 loops -> ~20k).
+
+Together the first three cut a busy single loop from ~17.7k to ~3.6k `io_uring_enter`
+over 2s and dropped write syscalls to zero; the last closed the high-thread gap.
+
+The 16-loop margin (+3%) is the thinnest and noisiest - 16 loops oversubscribe the
+12-core host - so the solid wins are at 1-8 loops.
 
 ## Caveats
 
