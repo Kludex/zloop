@@ -16,6 +16,9 @@ icon: lucide/zap
 
 ---
 
+!!! warning "Experimental"
+    zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
+
 zloop is an [asyncio](https://docs.python.org/3/library/asyncio.html) event loop whose
 engine is written in [Zig](https://ziglang.org). It is to asyncio what
 [uvloop](https://github.com/MagicStack/uvloop) is: a **drop-in replacement** for the

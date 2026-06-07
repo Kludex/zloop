@@ -1,5 +1,7 @@
 //! Pure-Zig core: the event loop engine, independent of CPython.
 
+const builtin = @import("builtin");
+
 pub const sys = @import("sys.zig");
 pub const reactor = @import("reactor.zig");
 pub const timers = @import("timers.zig");
@@ -14,4 +16,6 @@ test {
     _ = queue;
     _ = clock;
     _ = loop;
+    if (builtin.os.tag == .linux) _ = @import("uring.zig");
+    if (builtin.os.tag == .linux) _ = @import("completor.zig");
 }

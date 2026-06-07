@@ -31,6 +31,13 @@ fn PyInit__zloop() callconv(.c) ?*c.PyObject {
     const m = c.PyModule_Create(&module_def);
     if (m == null) return null;
 
+    // Declare free-threading support so importing on a free-threaded build does
+    // not force the GIL back on. Available only on free-threaded CPython; the
+    // @hasDecl guard makes this a no-op on regular (GIL) builds.
+    if (@hasDecl(c, "PyUnstable_Module_SetGIL")) {
+        _ = c.PyUnstable_Module_SetGIL(m, c.Py_MOD_GIL_NOT_USED);
+    }
+
     if (!handle.registerTypes(m)) {
         py.decref(m);
         return null;

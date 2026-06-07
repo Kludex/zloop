@@ -1,12 +1,15 @@
 #!/bin/sh -e
 
-# Create the virtual environment and install the dev + docs dependency groups.
-# `uv sync` builds the Zig extension through the hatchling build hook
-# (hatch_build.py), so no separate compile step is needed - it just needs `zig`
-# on PATH.
+# Create the virtual environment and install dependency groups. `uv sync` builds
+# the Zig extension through the hatch-ziglang build hook, so no separate compile
+# step is needed - it just needs `zig` on PATH.
+#
+# ZLOOP_SYNC_GROUPS overrides which groups are installed (default: all). The
+# free-threaded CI leg sets it to skip the docs group, whose zensical dep has no
+# free-threaded wheel and can't build from source there.
 
 if [ -z "$GITHUB_ACTIONS" ]; then
     set -x
 fi
 
-uv sync --frozen --all-groups
+uv sync --frozen ${ZLOOP_SYNC_GROUPS:---all-groups}

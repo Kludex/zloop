@@ -1,5 +1,8 @@
 # zloop
 
+> [!WARNING]
+> zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
+
 A drop-in [asyncio](https://docs.python.org/3/library/asyncio.html) event loop
 whose engine is written in [Zig](https://ziglang.org). It's to asyncio what
 [uvloop](https://github.com/MagicStack/uvloop) is - a real
