@@ -5,6 +5,10 @@ icon: lucide/zap
 # zloop
 
 <p align="center">
+    <img src="assets/logo.png" alt="zloop" width="320">
+</p>
+
+<p align="center">
     <em>An asyncio event loop with a Zig core - a drop-in, faster-than-uvloop alternative.</em>
 </p>
 
