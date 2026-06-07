@@ -137,23 +137,23 @@ and the reason a drop-in loop like zloop is even possible. 🙂
 ## HTTP clients
 
 zloop is a client-side loop too. Libraries that do their network I/O over
-asyncio's TCP/TLS transports - [HTTPX](https://www.python-httpx.org),
+asyncio's TCP/TLS transports - [HTTPX2](https://github.com/pydantic/httpx2),
 [aiohttp](https://docs.aiohttp.org), and most database drivers and message-queue
 clients - run on it.
 
 You don't configure the library. You just run your code on a zloop loop, and the
 library uses whatever loop is running.
 
-```python title="httpx_example.py"
+```python title="httpx2_example.py"
 import asyncio
 
-import httpx
+import httpx2
 
 import zloop
 
 
 async def main():
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         r = await client.get("https://example.com")
         print(r.status_code)  #> 200
 
@@ -161,7 +161,7 @@ async def main():
 asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ```
 
-HTTPX's async transport runs on the current event loop - which is zloop. TLS,
+HTTPX2's async transport runs on the current event loop - which is zloop. TLS,
 connection pooling, timeouts: all handled by zloop's transports under the hood.
 aiohttp is the same story - run it on a zloop loop and its `ClientSession` uses it
 automatically.

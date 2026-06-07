@@ -65,6 +65,12 @@ everywhere).
 N loops on N threads, 8 conns/thread, 1 KB messages, Linux io_uring kernel 6.10,
 3-sample medians on a 12-CPU host, requests/sec:
 
+<figure markdown="span">
+  ![Free-threaded throughput across parallel loops: uvloop vs zloop epoll vs zloop io_uring](../assets/ft-bench.svg){ width="720" }
+  <figcaption>N parallel loops (one per thread) on free-threaded CPython, GIL
+  off. The io_uring completion backend leads at every thread count.</figcaption>
+</figure>
+
 | loops | uvloop    | zloop epoll | zloop io_uring |
 | ----: | --------: | ----------: | -------------: |
 |     1 |   174,185 |     163,900 |    **209,071** |
