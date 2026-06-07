@@ -8,7 +8,7 @@ zloop is an `asyncio.AbstractEventLoop`. Not "asyncio-like" - the real thing. So
 the asyncio APIs you reach for day to day - tasks, futures, timers, streams,
 executors, signals, TLS - work on top of it. And because
 [AnyIO](https://anyio.readthedocs.io) runs on asyncio, AnyIO programs (Starlette,
-FastAPI, HTTPX) run on zloop too - covered [further down](#with-anyio).
+FastAPI, HTTPX2) run on zloop too - covered [further down](#with-anyio).
 
 Let's walk through them, so you can see there are no surprises. (A handful of
 lower-level loop APIs aren't implemented yet; the
@@ -192,7 +192,7 @@ asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ## With AnyIO
 
 [AnyIO](https://anyio.readthedocs.io) is the structured-concurrency layer that
-sits on top of asyncio. It's what Starlette, FastAPI, and HTTPX use internally -
+sits on top of asyncio. It's what Starlette, FastAPI, and HTTPX2 use internally -
 so making AnyIO run on zloop means a *lot* of the ecosystem runs on zloop.
 
 The good news: AnyIO's asyncio backend accepts a **loop factory**, so this is a

@@ -25,7 +25,8 @@ engine is written in [Zig](https://ziglang.org). It is to asyncio what
 default event loop that you can use without changing your application code.
 
 The difference is what's underneath. uvloop wraps libuv from Cython; zloop is a
-hand-written kqueue/epoll reactor in Zig, bound to CPython through a thin adapter.
+hand-written reactor in Zig - kqueue/epoll, plus an opt-in io_uring backend on
+Linux - bound to CPython through a thin adapter.
 
 The key features are:
 

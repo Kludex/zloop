@@ -6,8 +6,9 @@
 A drop-in [asyncio](https://docs.python.org/3/library/asyncio.html) event loop
 whose engine is written in [Zig](https://ziglang.org). It's to asyncio what
 [uvloop](https://github.com/MagicStack/uvloop) is - a real
-`asyncio.AbstractEventLoop` - except the engine is a hand-written kqueue/epoll
-reactor in Zig rather than libuv wrapped in Cython.
+`asyncio.AbstractEventLoop` - except the engine is hand-written in Zig (a
+kqueue/epoll reactor, plus an opt-in io_uring backend on Linux) rather than
+libuv wrapped in Cython.
 
 ```python
 import asyncio
@@ -25,7 +26,7 @@ uvicorn app:app --loop zloop:new_event_loop
 ## Why
 
 - **Drop-in.** A genuine `AbstractEventLoop`, so the asyncio ecosystem -
-  uvicorn, FastAPI, AnyIO, HTTPX - runs on it unchanged.
+  uvicorn, FastAPI, AnyIO, HTTPX2 - runs on it unchanged.
 - **Correct.** Passes [uvicorn](https://github.com/encode/uvicorn)'s **entire**
   test suite (1048 tests), identical to stock asyncio, plus its own suite at
   **100%** coverage.
@@ -68,6 +69,8 @@ Under free-threaded CPython (3.14t), N independent loops on N threads stop being
 serialized by the GIL - and the leaner completion path (batched submits,
 multishot recv, ring writes, cached `data_received`) **beats uvloop at every
 thread count**. 1 KB messages, 8 conns/thread, requests/sec:
+
+![Free-threaded throughput: uvloop vs zloop epoll vs zloop io_uring across parallel loops](https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/ft-bench.svg)
 
 | loops | uvloop    | zloop epoll | zloop io_uring |
 | ----: | --------: | ----------: | -------------: |
