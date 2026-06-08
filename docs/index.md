@@ -5,7 +5,7 @@ icon: lucide/zap
 # zloop
 
 <p align="center">
-    <img src="assets/logo.png" alt="zloop" height="120">
+    <img src="assets/logo.png" alt="zloop" style="height: clamp(144px, 20vw, 252px)">
 </p>
 
 <p align="center">

@@ -1,7 +1,7 @@
 # zloop
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/logo.png" alt="zloop" height="120">
+  <img src="https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/logo.png" alt="zloop" height="190">
 </p>
 
 > [!WARNING]
