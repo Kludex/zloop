@@ -151,6 +151,134 @@ def test_create_connection_local_addr(loop: asyncio.AbstractEventLoop) -> None:
     assert sockname[0] == "127.0.0.1"
 
 
+def test_create_connection_happy_eyeballs(loop: asyncio.AbstractEventLoop) -> None:
+    # happy_eyeballs_delay routes through staggered_race; the connection must
+    # still succeed (and implicitly enables interleave=1).
+    async def main() -> bytes:
+        server, host, port = await _echo_server(loop)
+        got: asyncio.Future[bytes] = loop.create_future()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                transport.write(b"he")  # type: ignore[attr-defined]
+                self.transport = transport
+
+            def data_received(self, data: bytes) -> None:
+                if not got.done():
+                    got.set_result(data)
+                self.transport.close()  # type: ignore[attr-defined]
+
+        await loop.create_connection(Client, host, port, happy_eyeballs_delay=0.1)
+        result = await asyncio.wait_for(got, 2.0)
+        server.close()
+        await server.wait_closed()
+        return result
+
+    assert run(loop, main()) == b"he"
+
+
+def test_create_connection_interleave(loop: asyncio.AbstractEventLoop) -> None:
+    async def main() -> bytes:
+        server, host, port = await _echo_server(loop)
+        got: asyncio.Future[bytes] = loop.create_future()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                transport.write(b"il")  # type: ignore[attr-defined]
+                self.transport = transport
+
+            def data_received(self, data: bytes) -> None:
+                if not got.done():
+                    got.set_result(data)
+                self.transport.close()  # type: ignore[attr-defined]
+
+        await loop.create_connection(Client, host, port, interleave=2)
+        result = await asyncio.wait_for(got, 2.0)
+        server.close()
+        await server.wait_closed()
+        return result
+
+    assert run(loop, main()) == b"il"
+
+
+def test_create_connection_all_errors_raises_group(loop: asyncio.AbstractEventLoop) -> None:
+    # "localhost" resolves to both ::1 and 127.0.0.1, so a dead port yields more
+    # than one failure - all of which all_errors collects into the group.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    _, port = s.getsockname()
+    s.close()
+
+    async def main() -> None:
+        with pytest.raises(ExceptionGroup) as excinfo:
+            await loop.create_connection(asyncio.Protocol, "localhost", port, all_errors=True)
+        assert all(isinstance(exc, OSError) for exc in excinfo.value.exceptions)
+
+    run(loop, main())
+
+
+def test_create_connection_multiple_addresses_refused(loop: asyncio.AbstractEventLoop) -> None:
+    # Without all_errors, several failures with the same message collapse to one.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    _, port = s.getsockname()
+    s.close()
+
+    async def main() -> None:
+        with pytest.raises(OSError) as excinfo:
+            await loop.create_connection(asyncio.Protocol, "localhost", port)
+        assert not isinstance(excinfo.value, ExceptionGroup)
+
+    run(loop, main())
+
+
+def test_create_connection_local_addr_bind_fails(loop: asyncio.AbstractEventLoop) -> None:
+    # A local_addr the host cannot bind makes every attempt fail; the bind error
+    # surfaces (wrapped with the address context, like asyncio).
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)
+        try:
+            with pytest.raises(OSError) as excinfo:
+                await loop.create_connection(asyncio.Protocol, host, port, local_addr=("1.2.3.4", 0))
+            assert "bind on address" in str(excinfo.value)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    run(loop, main())
+
+
+def test_create_connection_local_addr_family_mismatch(loop: asyncio.AbstractEventLoop) -> None:
+    # An IPv6-only local_addr against an IPv4 target matches no family, so every
+    # attempt fails with "no matching local address".
+    async def main() -> None:
+        server, host, port = await _echo_server(loop)  # IPv4 (127.0.0.1)
+        try:
+            with pytest.raises(OSError) as excinfo:
+                await loop.create_connection(asyncio.Protocol, host, port, local_addr=("::1", 0))
+            assert "no matching local address" in str(excinfo.value)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    run(loop, main())
+
+
+def test_create_connection_happy_eyeballs_all_fail(loop: asyncio.AbstractEventLoop) -> None:
+    # happy eyeballs + a dead port: staggered_race exhausts every attempt and
+    # the collected errors surface (here as a single OSError, not a group).
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    _, port = s.getsockname()
+    s.close()
+
+    async def main() -> None:
+        with pytest.raises(OSError):
+            await loop.create_connection(asyncio.Protocol, "127.0.0.1", port, happy_eyeballs_delay=0.05)
+
+    run(loop, main())
+
+
 def test_transport_writelines(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> bytes:
         server, host, port = await _echo_server(loop)
