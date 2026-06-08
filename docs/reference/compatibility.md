@@ -64,7 +64,7 @@ These raise `NotImplementedError` (most are inherited `AbstractEventLoop` stubs)
 | --- | --- |
 | **Python** | CPython 3.12+ |
 | **macOS / BSD** | ✅ via `kqueue` |
-| **Linux** | ✅ via `epoll` |
+| **Linux** | ✅ via `epoll` (opt-in `io_uring` completion backend) |
 | **Windows** | ❌ not supported |
 
 !!! note "A word on honesty"

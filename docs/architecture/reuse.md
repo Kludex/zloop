@@ -73,7 +73,7 @@ thread through that same executor. Standard asyncio strategy.
 
 Everything that makes it an *event loop*: the run cycle, the timer heap, the
 callback queue, the kqueue/epoll reactor (plus the opt-in
-[io_uring completion port](completion.md)), the connected-socket transport I/O,
+[io_uring completion port](the-loop.md#the-completion-backend-io_uring)), the connected-socket transport I/O,
 the flow control, the GIL bracketing, the self-pipe wakeup.
 
 That's the part where performance lives, and that's the part written in Zig. The

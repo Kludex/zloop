@@ -19,12 +19,15 @@ nothing to configure and no system libraries to install.
 zloop is a CPython extension with a Zig core. It needs:
 
 * **CPython 3.12 or higher**
-* **macOS / BSD** (using `kqueue`) or **Linux** (using `epoll`)
+* **macOS / BSD** (using `kqueue`) or **Linux** (using `epoll`, plus an opt-in
+  `io_uring` backend)
 
 !!! info "Why those platforms?"
     The event loop's I/O engine talks directly to the operating system's
     readiness API. On macOS and the BSDs that's `kqueue`; on Linux it's
-    `epoll`. Windows isn't supported (yet) - `IOCP` is a different model.
+    `epoll`, with an opt-in `io_uring` completion backend
+    (`ZLOOP_IO_URING=completion`). Windows isn't supported (yet) - `IOCP` is a
+    different model.
 
 ## Verifying the install
 

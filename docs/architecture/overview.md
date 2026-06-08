@@ -72,8 +72,9 @@ Reading it bottom-up:
 
 * **[`reactor.zig`](the-loop.md#the-reactor)** - the kqueue/epoll demultiplexer.
   Knows nothing about Python or callbacks; it maps file descriptors to readiness.
-* **[`completor.zig`](completion.md)** - an opt-in io_uring *completion* port (the
-  Proactor model), a Linux-only sibling of the reactor. Off by default.
+* **[`completor.zig`](the-loop.md#the-completion-backend-io_uring)** - an opt-in
+  io_uring *completion* port (the Proactor model), a Linux-only sibling of the
+  reactor. Off by default.
 * **[`loop.zig`](the-loop.md#the-loop-engine)** - the actual event loop: timer
   heap, ready queue, and the `run_once` cycle that drives everything.
 * **The CPython adapter** - the `Loop`, `Transport`, and `Handle` Python types.
@@ -99,11 +100,8 @@ coroutine stepping and TLS - instead of reimplementing famously-subtle code. See
 
 <div class="grid cards" markdown>
 
--   :material-sync: **[The loop & the reactor](the-loop.md)** - kqueue/epoll and
-    the run-once cycle.
-
--   :material-flash: **[The completion backend](completion.md)** - the opt-in
-    io_uring (Proactor) path.
+-   :material-sync: **[The loop & the I/O backends](the-loop.md)** - kqueue/epoll,
+    the opt-in io_uring (Proactor) path, and the run-once cycle.
 
 -   :material-swap-horizontal: **[Transports & lifecycle](transports.md)** -
     sockets → protocols, and startup → shutdown.
