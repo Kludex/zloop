@@ -95,8 +95,11 @@ class _Server(asyncio.AbstractServer):
             self._loop.add_reader(sock.fileno(), self._accept, sock)
 
     def _accept(self, sock: socket.socket) -> None:
-        # Drain all pending connections for this readiness, stopping on EWOULDBLOCK.
-        while True:
+        # Accept a bounded burst per readiness so a connection flood can't starve
+        # timers and existing-connection I/O. Matches asyncio's backlog + 1 cap;
+        # the listening socket stays readable (level-triggered), so any remaining
+        # pending connections are accepted on the next loop iteration.
+        for _ in range(self._backlog + 1):
             try:
                 conn, _addr = sock.accept()
             except (BlockingIOError, InterruptedError):
