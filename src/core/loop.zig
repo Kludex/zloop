@@ -156,6 +156,13 @@ pub const Loop = struct {
     closed: bool = false,
     dropped: bool = false,
 
+    /// Monotonic timestamp of the last selector/completor poll. When callbacks
+    /// are already queued (timeout 0) and we polled within POLL_SKIP_WINDOW_NS,
+    /// runOnce skips the poll syscall entirely - a chain of call_soon -> call_soon
+    /// otherwise pays one kevent/epoll_wait per callback. The window bounds how
+    /// long a freshly-ready fd can wait behind a busy callback chain.
+    last_poll_ns: u64 = 0,
+
     /// Cross-thread inbox: call_soon_threadsafe appends here under `xlock` and
     /// wakes the loop; runOnce drains it into `ready` on the loop thread. The
     /// main ready queue is single-threaded and must never be touched off-thread.
@@ -166,6 +173,11 @@ pub const Loop = struct {
     wake_r: sys.fd_t,
     wake_w: sys.fd_t,
     const WAKE_TOKEN: usize = std.math.maxInt(usize);
+
+    /// Max time the loop will go without a real poll while it has ready work to
+    /// run: long enough to collapse call_soon chains into syscall-free iterations,
+    /// short enough that fd readiness is never starved.
+    const POLL_SKIP_WINDOW_NS: u64 = 250 * std.time.ns_per_us;
 
     pub fn init(allocator: std.mem.Allocator, dispatcher: Dispatcher) !Loop {
         var r = try Reactor.init(allocator);
@@ -493,6 +505,20 @@ pub const Loop = struct {
         self.drainXthread();
         const timeout = self.computeTimeout(max_wait_ns);
 
+        // Skip the selector syscall when we have queued work to run and polled
+        // within the skip window: a call_soon chain otherwise pays one
+        // kevent/epoll_wait per callback. Gate on the ready queue itself, not on
+        // timeout 0 - a nonblocking runOnce(0) with an empty queue also yields
+        // timeout 0, and there the caller is asking for an I/O check we must not
+        // skip. Freshly-ready fds wait at most POLL_SKIP_WINDOW_NS.
+        if (!self.ready.isEmpty() and !self.stopping) {
+            const t = clock.nowNs();
+            if (t -% self.last_poll_ns < POLL_SKIP_WINDOW_NS) {
+                self.runDue(t);
+                return;
+            }
+        }
+
         // Release the embedder's global lock (GIL) only when we will actually
         // block, so other threads can run and post work via call_soon_threadsafe
         // and so signals can be delivered.
@@ -501,6 +527,7 @@ pub const Loop = struct {
         if (will_block) {
             if (self.dispatcher.suspend_) |s| resume_state = s(self.dispatcher.ctx);
         }
+        self.last_poll_ns = clock.nowNs();
 
         if (has_completion and self.completor != null) {
             const co = &self.completor.?;
@@ -536,7 +563,13 @@ pub const Loop = struct {
             }
         }
 
-        const t_now = clock.nowNs();
+        self.runDue(clock.nowNs());
+    }
+
+    /// Promote due timers into `ready`, then run a snapshot of the ready queue.
+    /// Callbacks scheduled while draining run on the next iteration (asyncio
+    /// snapshot semantics), which also keeps them eligible for the skip-poll path.
+    fn runDue(self: *Loop, t_now: u64) void {
         while (self.timers.popDue(t_now)) |timer| {
             // The timer is already popped; on OOM release its token rather than
             // erroring out of the loop and leaking the Handle ref.
@@ -745,6 +778,63 @@ test "call_soon runs in fifo on next iteration" {
     try loop.callSoon(2);
     try loop.runOnce(0);
     try testing.expectEqualSlices(usize, &.{ 1, 2 }, td.runs.items);
+}
+
+test "skip-poll: a fresh call_soon after a poll runs without re-polling" {
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    // Watch a readable fd, then make it readable. The first runOnce polls (window
+    // has lapsed since last_poll_ns == 0) and stamps last_poll_ns.
+    var counter = IoCounter{};
+    try loop.addReader(fds[0], counter.callback());
+    _ = try sys.write(fds[1], "x");
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 1), counter.reads);
+
+    // Make the fd readable AGAIN, then queue a callback and run. Because we polled
+    // microseconds ago and have ready work, runOnce takes the skip path: it runs
+    // the queued callback but does NOT observe the new readability this turn.
+    _ = try sys.write(fds[1], "y");
+    try loop.callSoon(7);
+    try loop.runOnce(0);
+    try testing.expectEqualSlices(usize, &.{7}, td.runs.items);
+    try testing.expectEqual(@as(u32, 1), counter.reads); // skipped the poll
+
+    // Force the window to lapse; the next runOnce polls and sees the readability.
+    loop.last_poll_ns -%= Loop.POLL_SKIP_WINDOW_NS + 1;
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 2), counter.reads);
+}
+
+test "skip-poll: nonblocking runOnce(0) with no queued work still polls I/O" {
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    // Poll once so last_poll_ns is recent (inside the skip window).
+    var counter = IoCounter{};
+    try loop.addReader(fds[0], counter.callback());
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 0), counter.reads);
+
+    // Make the fd readable and ask for a nonblocking iteration with an empty
+    // ready queue. timeout is 0 (the max_wait cap), but with no queued work the
+    // skip must NOT fire - the I/O check the caller asked for has to happen.
+    _ = try sys.write(fds[1], "x");
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 1), counter.reads);
 }
 
 test "timer fires after deadline" {
