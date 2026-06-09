@@ -505,11 +505,13 @@ pub const Loop = struct {
         self.drainXthread();
         const timeout = self.computeTimeout(max_wait_ns);
 
-        // Skip the selector syscall when we have ready work to run (timeout 0)
-        // and polled within the skip window: a call_soon chain otherwise pays one
-        // kevent/epoll_wait per callback. Freshly-ready fds wait at most
-        // POLL_SKIP_WINDOW_NS, then a poll runs because the window lapsed.
-        if (timeout != null and timeout.? == 0 and !self.stopping) {
+        // Skip the selector syscall when we have queued work to run and polled
+        // within the skip window: a call_soon chain otherwise pays one
+        // kevent/epoll_wait per callback. Gate on the ready queue itself, not on
+        // timeout 0 - a nonblocking runOnce(0) with an empty queue also yields
+        // timeout 0, and there the caller is asking for an I/O check we must not
+        // skip. Freshly-ready fds wait at most POLL_SKIP_WINDOW_NS.
+        if (!self.ready.isEmpty() and !self.stopping) {
             const t = clock.nowNs();
             if (t -% self.last_poll_ns < POLL_SKIP_WINDOW_NS) {
                 self.runDue(t);
@@ -809,6 +811,30 @@ test "skip-poll: a fresh call_soon after a poll runs without re-polling" {
     loop.last_poll_ns -%= Loop.POLL_SKIP_WINDOW_NS + 1;
     try loop.runOnce(0);
     try testing.expectEqual(@as(u32, 2), counter.reads);
+}
+
+test "skip-poll: nonblocking runOnce(0) with no queued work still polls I/O" {
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    const fds = try sys.pipe();
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+
+    // Poll once so last_poll_ns is recent (inside the skip window).
+    var counter = IoCounter{};
+    try loop.addReader(fds[0], counter.callback());
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 0), counter.reads);
+
+    // Make the fd readable and ask for a nonblocking iteration with an empty
+    // ready queue. timeout is 0 (the max_wait cap), but with no queued work the
+    // skip must NOT fire - the I/O check the caller asked for has to happen.
+    _ = try sys.write(fds[1], "x");
+    try loop.runOnce(0);
+    try testing.expectEqual(@as(u32, 1), counter.reads);
 }
 
 test "timer fires after deadline" {
