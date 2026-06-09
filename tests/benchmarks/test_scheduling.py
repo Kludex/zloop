@@ -28,6 +28,9 @@ def test_call_later_cancel(benchmark: BenchmarkFixture) -> None:
         handles = [loop.call_later(10, lambda: None) for _ in range(1000)]
         for handle in handles:
             handle.cancel()
+        # Cancellation is lazy; drain the timer heap so the next iteration
+        # starts fresh instead of measuring an ever-growing backlog.
+        loop.run_until_complete(asyncio.sleep(0))
 
     try:
         benchmark(schedule_and_cancel)
