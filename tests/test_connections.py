@@ -48,6 +48,35 @@ def test_create_connection_roundtrip(loop: asyncio.AbstractEventLoop) -> None:
     assert run(loop, main()) == b"ping"
 
 
+def test_create_connection_large_payload_roundtrip(loop: asyncio.AbstractEventLoop) -> None:
+    # A payload several times READ_CHUNK (256 KiB) exercises the read path's drain
+    # loop across many recv() calls rather than the single-read fast case.
+    payload = b"x" * (1024 * 1024)
+
+    async def main() -> bytes:
+        server, host, port = await _echo_server(loop)
+        got: asyncio.Future[bytes] = loop.create_future()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                self.buf = bytearray()
+                transport.write(payload)  # type: ignore[attr-defined]
+
+            def data_received(self, data: bytes) -> None:
+                self.buf.extend(data)
+                if len(self.buf) >= len(payload) and not got.done():
+                    got.set_result(bytes(self.buf))
+
+        transport, protocol = await loop.create_connection(Client, host, port)
+        result = await asyncio.wait_for(got, 5.0)
+        transport.close()
+        server.close()
+        await server.wait_closed()
+        return result
+
+    assert run(loop, main()) == payload
+
+
 def test_create_connection_with_sock(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> bytes:
         server, host, port = await _echo_server(loop)
