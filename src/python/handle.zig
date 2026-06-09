@@ -9,6 +9,13 @@ const std = @import("std");
 const py = @import("py.zig");
 const c = py.c;
 
+// Free-threading guards (ft_critical.c). Each takes a critical section keyed on
+// the Handle so dispatch reading (callback, args, context) cannot race with
+// cancel clearing them on a no-GIL build. No-ops under the GIL.
+extern fn zloop_handle_snapshot(op: py.Object, callback: *py.Object, args: *py.Object, context: *py.Object) c_int;
+extern fn zloop_handle_mark_cancelled(op: py.Object) c_int;
+extern fn zloop_handle_clear_refs(op: py.Object) void;
+
 pub const HandleObject = extern struct {
     ob_base: c.PyObject,
     callback: py.Object,
@@ -25,6 +32,17 @@ pub const HandleObject = extern struct {
     /// (matches asyncio.Handle, which keeps self._loop).
     loop_obj: py.Object,
 };
+
+comptime {
+    // ft_critical.c reinterprets a Handle through ZloopHandleHead, which mirrors
+    // these first fields in order. Keep the two layouts in lockstep.
+    const head = @offsetOf(HandleObject, "ob_base");
+    std.debug.assert(head == 0);
+    std.debug.assert(@offsetOf(HandleObject, "callback") == @sizeOf(c.PyObject));
+    std.debug.assert(@offsetOf(HandleObject, "args") > @offsetOf(HandleObject, "callback"));
+    std.debug.assert(@offsetOf(HandleObject, "context") > @offsetOf(HandleObject, "args"));
+    std.debug.assert(@offsetOf(HandleObject, "cancelled") > @offsetOf(HandleObject, "context"));
+}
 
 var handle_type: py.Object = null;
 var timer_type: py.Object = null;
@@ -77,12 +95,21 @@ fn makeContext() py.Object {
 /// Execute the handle: call context.run(callback, *args), routing any exception
 /// to the loop's exception handler. Safe to call on a cancelled handle (no-op).
 pub fn run(self: *HandleObject) void {
-    if (self.cancelled != 0 or self.callback == null) return;
+    // Snapshot (callback, args, context) under the Handle's critical section,
+    // taking our own references so a concurrent cancel() on another thread
+    // cannot free them mid-call on a no-GIL build. No-op lock under the GIL.
+    var callback: py.Object = null;
+    var args: py.Object = null;
+    var context: py.Object = null;
+    if (zloop_handle_snapshot(@ptrCast(self), &callback, &args, &context) == 0) return;
+    defer py.xdecref(callback);
+    defer py.xdecref(args);
+    defer py.xdecref(context);
 
-    const result = if (self.context != null and !py.isNone(self.context))
-        runInContext(self)
+    const result = if (context != null and !py.isNone(context))
+        runInContext(callback, args, context)
     else
-        py.callTuple(self.callback, self.args);
+        py.callTuple(callback, args);
 
     if (result == null) {
         reportException(self);
@@ -91,14 +118,14 @@ pub fn run(self: *HandleObject) void {
     }
 }
 
-fn runInContext(self: *HandleObject) py.Object {
+fn runInContext(callback: py.Object, args: py.Object, context: py.Object) py.Object {
     // Enter the captured context, invoke callback(*args) directly, then exit -
     // the raw C-API path (no `context.run` attribute lookup or extra arg tuple).
-    if (c.PyContext_Enter(self.context) != 0) return null;
-    const result = py.callTuple(self.callback, self.args);
+    if (c.PyContext_Enter(context) != 0) return null;
+    const result = py.callTuple(callback, args);
     // Exit even on error; preserve the callback's exception across the exit.
     const exc = py.fetchException();
-    if (c.PyContext_Exit(self.context) != 0) {
+    if (c.PyContext_Exit(context) != 0) {
         // A failed exit is unexpected; surface it if the callback itself was OK.
         if (exc != null) py.decref(exc);
         py.xdecref(result);
@@ -158,12 +185,15 @@ fn dealloc(self_obj: ?*c.PyObject) callconv(.c) void {
 
 fn cancel(self_obj: ?*c.PyObject, _: ?*c.PyObject) callconv(.c) py.Object {
     const self: *HandleObject = @ptrCast(self_obj.?);
-    if (self.cancelled == 0) {
-        self.cancelled = 1;
+    // Mark cancelled and clear the callback refs under the Handle's critical
+    // section (no-op lock under the GIL) so this can't race a concurrent run()
+    // on the loop thread. The timer-heap cancel runs between the two, outside
+    // the lock, because it is only ever touched on the loop's own thread.
+    if (zloop_handle_mark_cancelled(@ptrCast(self)) != 0) {
         if (self.is_timer != 0 and self.loop_obj != null) {
             cancelTimerOnLoop(self);
         }
-        py.clearCallbackRefs(self);
+        zloop_handle_clear_refs(@ptrCast(self));
     }
     return py.none();
 }

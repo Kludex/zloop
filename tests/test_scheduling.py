@@ -70,6 +70,28 @@ def test_call_soon_requires_callable(loop: asyncio.AbstractEventLoop) -> None:
         loop.call_soon(123)
 
 
+def test_handle_cancel_during_run_does_not_drop_in_flight_call(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    # run() snapshots (callback, args, context) with its own references before
+    # invoking, so a cancel() that clears and decrefs those fields mid-dispatch
+    # (here the callback cancels its own handle) cannot free them under the call.
+    seen = []
+    box: list[asyncio.Handle] = []
+
+    def cb(value: object) -> None:
+        box[0].cancel()
+        seen.append(value)
+
+    async def main() -> None:
+        box.append(loop.call_soon(cb, "payload"))
+        await asyncio.sleep(0)
+
+    run(loop, main())
+    assert seen == ["payload"]
+    assert box[0].cancelled() is True
+
+
 def test_sleep_delays(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> float:
         t0 = loop.time()
