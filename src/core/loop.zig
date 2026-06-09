@@ -78,7 +78,6 @@ pub const CompletionCallback = struct {
     func: *const fn (ctx: *anyopaque, res: IoResult) void,
     ctx: *anyopaque,
     dispose: ?*const fn (ctx: *anyopaque) void = null,
-    gen: u32 = 0, // current generation; a CQE with a stale gen is dropped
 
     fn fire(self: CompletionCallback, res: IoResult) void {
         self.func(self.ctx, res);
@@ -249,6 +248,19 @@ pub const Loop = struct {
 
     fn compGen(self: *Loop, fd: sys.fd_t) CompGen {
         return self.comp_gen.get(fd) orelse .{};
+    }
+
+    /// Ensure `fd` has an explicit generation entry before a data op is submitted.
+    /// A live op must always be backed by an entry: dispatchCompletion treats a
+    /// missing entry as stale, so submitting against the bare default (gen 0, no
+    /// entry) would let a stale gen-0 CQE from a closed-then-reused fd pass the
+    /// generation check and cross-deliver into the new transport. Returns the
+    /// current generation, preserving any value bumped by a prior teardown so a
+    /// reused fd keeps counting up instead of resetting to 0.
+    fn ensureCompGen(self: *Loop, fd: sys.fd_t) !CompGen {
+        const gop = try self.comp_gen.getOrPut(fd);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr.*;
     }
 
     /// Bump the generation for `kind` (recv, send, or poll) on `fd` and return the
@@ -464,12 +476,17 @@ pub const Loop = struct {
         }
     }
 
-    /// Drop the generation entry for `fd` once neither a readiness watch (`fds`)
-    /// nor a data op (`comp_fds`) remains. Keeping it while either is live is what
-    /// lets a late CQE be recognized as stale; removing it too early would reset
-    /// the counter to 0 and let a stale CQE masquerade as current after reuse.
+    /// Intentionally retain the generation entry after an fd's last watch/op is
+    /// gone. io_uring can still reap already-posted or cancellation CQEs for a
+    /// closed fd, and the kernel may reuse that fd number for a new connection
+    /// before they drain. The retained, bumped generation is exactly what makes
+    /// those old CQEs mismatch and be dropped instead of cross-delivered. The
+    /// entry is not leaked unboundedly: a reused fd reclaims it in place via
+    /// ensureCompGen (keeping the higher generation), so only fds never reused
+    /// retain one - bounded by the loop's high-water fd count.
     fn gcGen(self: *Loop, fd: sys.fd_t) void {
-        if (!self.fds.contains(fd) and !self.comp_fds.contains(fd)) _ = self.comp_gen.remove(fd);
+        _ = self;
+        _ = fd;
     }
 
     fn fdToken(fd: sys.fd_t) usize {
@@ -623,7 +640,13 @@ pub const Loop = struct {
         // Drop a late CQE whose generation no longer matches its op family (fd
         // reused, or the op superseded). recv and poll carry independent
         // generations, so a write-interest re-arm never invalidates a live recv.
-        const cur = if (self.comp_gen.get(fd)) |g| g.of(kind) else gen;
+        // A missing entry means no live op is backed for this fd, so the CQE is
+        // stale by definition - dropping it (not accepting it as gen 0) is what
+        // stops an old recv CQE from cross-delivering into a reused fd.
+        const cur = if (self.comp_gen.get(fd)) |g| g.of(kind) else {
+            if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
+            return;
+        };
         if (cur != gen) {
             if (comp.buf_id) |id| co.recycle(comp.flags, id, @intCast(@max(comp.result, 0)));
             return;
@@ -659,8 +682,9 @@ pub const Loop = struct {
         // the kernel dropped F_MORE on a still-live read stream (e.g. the buffer
         // ring momentarily ran dry) - and only if the fd is still being read.
         if (kind == .recv and comp.result > 0 and comp.flags & completion.F_MORE == 0) {
-            if (self.comp_fds.get(fd)) |live| {
-                self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, live.gen)) catch {};
+            if (self.comp_fds.contains(fd)) {
+                const g = self.compGen(fd).recv;
+                self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g)) catch {};
             }
         }
     }
@@ -671,13 +695,14 @@ pub const Loop = struct {
     /// write. Idempotent re-register just refreshes the callback.
     pub fn registerCompletion(self: *Loop, fd: sys.fd_t, cb: CompletionCallback) !void {
         if (!has_completion) return;
+        _ = try self.ensureCompGen(fd);
         try self.comp_fds.put(fd, cb);
     }
 
     /// Submit a (multishot) recv for `fd`. The callback must already be registered.
     pub fn startRecv(self: *Loop, fd: sys.fd_t) !void {
         if (!has_completion) return;
-        const g = self.compGen(fd).recv;
+        const g = (try self.ensureCompGen(fd)).recv;
         try self.completor.?.submitRecv(fd, completion.UserData.make(.recv, fd, g));
     }
 
@@ -696,7 +721,7 @@ pub const Loop = struct {
     /// send, and an unregister drops a late send CQE.
     pub fn submitSend(self: *Loop, fd: sys.fd_t, buf: []const u8) void {
         if (!has_completion) return;
-        const g = self.compGen(fd).send;
+        const g = (self.ensureCompGen(fd) catch return).send;
         self.completor.?.submitSend(fd, buf, completion.UserData.make(.send, fd, g)) catch {};
     }
 
@@ -953,6 +978,31 @@ test "completion: write interest does not drop a pending recv" {
 
     loop.stopIo(fds[0]);
     _ = loop.removeWriter(fds[0]);
+}
+
+// Regression: the per-fd generation entry must survive an fd's teardown. A late
+// recv CQE for a closed fd can still be reaped after the OS has reused that fd
+// number; if gcGen dropped the entry, the reused fd would recv at generation 0
+// again and the stale CQE (also generation 0) would pass the staleness check and
+// cross-deliver into the new transport. Retaining the bumped generation is what
+// makes the stale CQE mismatch and be dropped. (Kernel-independent.)
+test "completion: generation survives fd teardown so a stale CQE mismatches" {
+    var td = TestDispatcher{ .allocator = testing.allocator };
+    defer td.deinit();
+    var loop = try Loop.init(testing.allocator, td.dispatcher());
+    defer loop.deinit();
+
+    const fd: sys.fd_t = 123;
+    _ = try loop.ensureCompGen(fd); // recv submitted at gen 0
+    try testing.expectEqual(@as(u32, 0), loop.compGen(fd).recv);
+
+    _ = loop.bumpGen(fd, .recv); // teardown bumps so late CQEs (gen 0) are stale
+    loop.gcGen(fd);
+    try testing.expectEqual(@as(u32, 1), loop.compGen(fd).recv);
+
+    // A reused fd reclaims the entry in place and keeps counting up - it never
+    // resets to 0, so an old gen-0 CQE can never masquerade as current.
+    try testing.expectEqual(@as(u32, 1), (try loop.ensureCompGen(fd)).recv);
 }
 
 // Completion-path write: submitSend delivers the bytes and posts a send CQE that
