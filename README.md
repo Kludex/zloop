@@ -18,7 +18,13 @@ libuv wrapped in Cython.
 import asyncio
 import zloop
 
-print(asyncio.run(asyncio.sleep(0, "hello from a Zig loop"), loop_factory=zloop.new_event_loop))
+
+async def main() -> None:
+    await asyncio.sleep(0)
+    print("hello from a Zig loop")
+
+
+asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ```
 
 With [uvicorn](https://www.uvicorn.org):
