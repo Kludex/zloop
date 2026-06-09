@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import threading
 
 import pytest
 
@@ -90,6 +92,41 @@ def test_handle_cancel_during_run_does_not_drop_in_flight_call(
     run(loop, main())
     assert seen == ["payload"]
     assert box[0].cancelled() is True
+
+
+@pytest.mark.skipif(
+    getattr(sys, "_is_gil_enabled", lambda: True)(),
+    reason="the cross-thread Handle race only exists on free-threaded builds",
+)
+def test_concurrent_cancel_during_dispatch_is_memory_safe(
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    # Regression: on a free-threaded build, run() reading a Handle's callback/args
+    # while another thread's cancel() clears and decrefs them is a use-after-free.
+    # Without the critical-section guard this segfaults within a few hundred
+    # iterations; the snapshot under the section makes it safe. The cancels race
+    # the loop's own dispatch, so "no crash" is the assertion.
+    box: dict[str, object] = {}
+
+    def canceller() -> None:
+        while not box.get("done"):
+            handle = box.get("handle")
+            if handle is not None:
+                handle.cancel()  # type: ignore[attr-defined]
+
+    async def main() -> None:
+        threads = [threading.Thread(target=canceller, daemon=True) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for i in range(10_000):
+            box["handle"] = loop.call_soon(lambda *a: None, i, "s", b"b", (1, 2))
+            await asyncio.sleep(0)
+            box["handle"] = None
+        box["done"] = True
+        for thread in threads:
+            thread.join()
+
+    run(loop, main())
 
 
 def test_sleep_delays(loop: asyncio.AbstractEventLoop) -> None:
