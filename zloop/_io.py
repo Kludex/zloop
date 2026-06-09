@@ -96,9 +96,12 @@ class _Server(asyncio.AbstractServer):
 
     def _accept(self, sock: socket.socket) -> None:
         # Accept a bounded burst per readiness so a connection flood can't starve
-        # timers and existing-connection I/O. Matches asyncio's backlog + 1 cap;
-        # the listening socket stays readable (level-triggered), so any remaining
-        # pending connections are accepted on the next loop iteration.
+        # timers and existing-connection I/O (matches asyncio's backlog + 1 cap).
+        # If the burst is exhausted with connections still queued, reschedule via
+        # call_soon rather than relying on a readiness re-fire: the io_uring poll
+        # backend is edge-triggered, so a partially drained listener would
+        # otherwise stall until the next new connection arrives. call_soon yields
+        # to other ready work first, preserving fairness.
         for _ in range(self._backlog + 1):
             try:
                 conn, _addr = sock.accept()
@@ -112,6 +115,10 @@ class _Server(asyncio.AbstractServer):
                     return
                 raise
             self._loop._connect_accepted(conn, self._protocol_factory, self._ssl)
+        else:
+            # Cap reached with the queue not yet drained; continue next iteration.
+            if self._active:
+                self._loop.call_soon(self._accept, sock)
 
     def close(self) -> None:
         sockets = self._sockets
