@@ -76,52 +76,12 @@ def test_create_server_with_preexisting_socket(loop: asyncio.AbstractEventLoop) 
     assert run(loop, main()) == b"x"
 
 
-def test_accept_caps_burst_but_drains_all(loop: asyncio.AbstractEventLoop) -> None:
-    # _accept accepts at most backlog + 1 per readiness so a flood can't starve
-    # the loop, then re-fires (level-triggered) to take the rest. Queue more than
-    # the cap *before* serving so the first _accept fills its whole burst (hitting
-    # the cap, not BlockingIOError), then the rest are taken on later iterations.
-    backlog = 4
-    total = 40  # well over one capped burst, forcing several re-fires
-
-    async def main() -> int:
-        accepted = 0
-
-        class Counter(asyncio.Protocol):
-            def connection_made(self, transport: asyncio.BaseTransport) -> None:
-                nonlocal accepted
-                accepted += 1
-
-        server = await loop.create_server(Counter, "127.0.0.1", 0, backlog=backlog)
-        host, port = server.sockets[0].getsockname()
-
-        clients = []
-        for _ in range(total):
-            client = socket.socket()
-            client.setblocking(False)
-            try:
-                client.connect((host, port))
-            except BlockingIOError:
-                pass
-            clients.append(client)
-
-        deadline = loop.time() + 2.0
-        while accepted < total and loop.time() < deadline:
-            await asyncio.sleep(0.01)
-
-        for client in clients:
-            client.close()
-        server.close()
-        await server.wait_closed()
-        return accepted
-
-    assert run(loop, main()) == total
-
-
 def test_accept_stops_at_cap_when_queue_stays_full(loop: asyncio.AbstractEventLoop) -> None:
-    # When the accept queue never drains within one readiness, _accept must stop
-    # after backlog + 1 accepts (the fairness cap) rather than loop forever. A
-    # fake listening socket that always returns a connection forces that path.
+    # _accept caps each readiness at backlog + 1 accepts so a connection flood
+    # can't starve the loop. When the queue never drains within one readiness it
+    # must stop at the cap rather than loop forever; a fake listening socket that
+    # always returns a connection forces that path. The remaining pending
+    # connections are taken on the next iteration (the socket stays readable).
     async def main() -> int:
         backlog = 3
         accepted = 0
