@@ -44,6 +44,10 @@ pub fn build(b: *std.Build) void {
     // Provide atomic helpers the free-threaded headers declare but Zig's
     // translate-c can't inline; harmless (unreferenced) on non-free-threaded builds.
     mod.addCSourceFile(.{ .file = b.path("src/python/ft_atomics.c") });
+    // Critical-section guards for Handle dispatch/cancel: real C because the
+    // Py_BEGIN/END_CRITICAL_SECTION macros don't survive translate-c. No-op
+    // under the GIL.
+    mod.addCSourceFile(.{ .file = b.path("src/python/ft_critical.c") });
 
     const lib = b.addLibrary(.{
         .name = "_zloop",

@@ -237,12 +237,3 @@ pub fn freeInstance(self: Object) void {
     const free = tp.*.tp_free.?;
     free(@ptrCast(self));
 }
-
-/// Release a Handle's callback/args/context references (called on cancel so a
-/// cancelled handle does not keep its closure alive). Defined here to avoid a
-/// circular dependency; the layout matches handle.HandleObject's first fields.
-pub fn clearCallbackRefs(handle: anytype) void {
-    clear(&handle.callback);
-    clear(&handle.args);
-    clear(&handle.context);
-}
