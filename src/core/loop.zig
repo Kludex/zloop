@@ -985,8 +985,11 @@ test "completion: write interest does not drop a pending recv" {
 // number; if gcGen dropped the entry, the reused fd would recv at generation 0
 // again and the stale CQE (also generation 0) would pass the staleness check and
 // cross-deliver into the new transport. Retaining the bumped generation is what
-// makes the stale CQE mismatch and be dropped. (Kernel-independent.)
+// makes the stale CQE mismatch and be dropped. The generation bookkeeping is
+// kernel-independent, but the guard keeps non-Linux builds from analysing the
+// io_uring completor (which only compiles on Linux), matching the tests above.
 test "completion: generation survives fd teardown so a stale CQE mismatches" {
+    if (!has_completion) return;
     var td = TestDispatcher{ .allocator = testing.allocator };
     defer td.deinit();
     var loop = try Loop.init(testing.allocator, td.dispatcher());
