@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling", "hatch-ziglang", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
+requires = ["hatchling", "hatch-ziglang==0.2.0", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
 build-backend = "hatchling.build"
 
 [project]
