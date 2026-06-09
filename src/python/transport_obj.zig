@@ -441,10 +441,13 @@ fn deliverSmall(st: *State) bool {
     }
     const data = py.c.PyBytes_FromStringAndSize(&buf, @intCast(n));
     if (data == null) {
-        // Even a small allocation failed: real OOM. Stop spinning - close the
-        // connection rather than livelock on an unreadable, undeliverable fd.
+        // Even a small allocation failed: real OOM. Force the teardown directly
+        // rather than via fatalError - building its OSError can also fail here,
+        // and closeTransport would then defer while writes are queued, leaving
+        // the reader registered to re-enter this same loop. doConnectionLost
+        // stops the reader and closes the fd unconditionally.
         py.c.PyErr_Clear();
-        fatalError(st, error.OutOfMemory);
+        doConnectionLost(st, null);
         return false;
     }
     const r = callDataReceived(st, data);
