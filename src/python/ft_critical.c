@@ -21,6 +21,14 @@
 #include <Python.h>
 #include <stddef.h>
 
+/* Py_BEGIN/END_CRITICAL_SECTION arrived in 3.13. On 3.12 (always GIL-bound, so
+ * no free-threading to guard) fall back to bare braces, matching what the 3.13+
+ * headers expand to on a regular build. */
+#ifndef Py_BEGIN_CRITICAL_SECTION
+#  define Py_BEGIN_CRITICAL_SECTION(op) {
+#  define Py_END_CRITICAL_SECTION() }
+#endif
+
 typedef struct {
     PyObject ob_base;
     PyObject *callback;
