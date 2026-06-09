@@ -28,11 +28,6 @@ over asyncio is a Linux number, so the CI table is the meaningful comparison.
 `run_matrix.sh` runs every cell **sequentially** — echo throughput is
 contention-sensitive, so running cells concurrently would skew the numbers.
 
-This throughput benchmark is separate from the **CodSpeed** micro-benchmarks in
-`tests/benchmarks/`, which track per-PR regressions on hot paths (`call_soon`,
-`sleep`, an echo round-trip). Run them with `pytest tests/benchmarks/ --codspeed`;
-the **CodSpeed** GitHub Actions workflow uploads the results.
-
 ## Results (macOS arm64, CPython 3.14, best of 3)
 
 requests/sec, higher is better:
