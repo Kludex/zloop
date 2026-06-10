@@ -54,12 +54,27 @@ const State = struct {
     send_buf: std.ArrayList(u8) = .empty,
     send_inflight: bool = false,
 
-    /// Completion-backend owned-recv state. In owned mode (ZLOOP_IO_URING=owned)
-    /// the kernel recv's straight into this pinned, uninitialised PyBytes - one
-    /// copy, like the readiness path, instead of a copy out of the ring. Held
-    /// (kernel-borrowed) until the recv completes; must not be freed while a recv
-    /// is in flight. null when not using owned recv. Owned.
+    /// Completion-backend owned-recv state: the kernel recv's straight into this
+    /// pinned, uninitialised PyBytes - one copy, like the readiness path, instead
+    /// of a copy out of the ring. Held (kernel-borrowed) until the recv completes;
+    /// must not be freed while a recv may be in flight, which is why pause_reading
+    /// leaves it pinned (the cancelled recv can still write into it until its
+    /// terminal CQE) and armOwnedRecv reuses it rather than reallocating. Owned.
     recv_buf: py.Object = null,
+    /// This connection's recv strategy on the completion backend (see
+    /// RecvStrategy). Reset by startReading; meaningless on readiness backends.
+    recv_strategy: RecvStrategy = .ring,
+    /// Consecutive owned-mode reads small enough for one ring buffer; at
+    /// OWNED_REVERT_AFTER the connection goes back to the multishot ring.
+    small_reads: u8 = 0,
+    /// Bumped by startReading/stopReading. Recv completion handlers snapshot it
+    /// before calling into Python and skip ALL re-arm/strategy steering if it
+    /// moved: a reentrant pause_reading+resume_reading already armed a fresh
+    /// recv, and arming a second one would interleave two live recvs on the fd.
+    recv_epoch: u32 = 0,
+    /// Completed adaptive strategy switches (ring->owned and owned->ring), for
+    /// tests and diagnostics: get_extra_info("zloop_recv_switches").
+    recv_switches: u32 = 0,
 
     reading: bool = true,
     /// Set once the peer half-closed and eof_received() asked to keep the
@@ -84,6 +99,24 @@ const State = struct {
         return self.writing_paused;
     }
 };
+
+/// Per-connection recv strategy on the completion backend.
+/// - ring: multishot recv from the provided-buffer ring - the default; cheapest
+///   for small messages (no per-message SQE).
+/// - switching: a full ring buffer revealed a large-message stream and the
+///   multishot's cancellation is in flight. The recv generation is NOT bumped,
+///   so ring CQEs already posted still deliver in order; the multishot's
+///   terminal CQE is the lossless handoff point to owned.
+/// - owned: single-shot recvs straight into a pinned 256 KiB PyBytes - one copy
+///   and one data_received per arrival instead of one per 64 KiB fragment.
+/// ZLOOP_IO_URING=owned pins the strategy to owned for every connection;
+/// ZLOOP_IO_URING=completion starts at ring and adapts per connection.
+const RecvStrategy = enum { ring, switching, owned };
+
+/// Consecutive owned reads that would have fit one ring buffer before reverting
+/// to the ring. Escalating again costs a cancel round-trip while reverting is
+/// free, so shrink slower than the (single full read) growth trigger.
+const OWNED_REVERT_AFTER: u8 = 4;
 
 /// Call `method_name(arg)` on the protocol under the connection's captured
 /// context, so contextvars set outside propagate into the ASGI task. Returns
@@ -479,30 +512,41 @@ fn usesOwnedRecv(st: *State) bool {
     return usesCompletion(st) and st.engine.isOwnedRecv();
 }
 
-/// Allocate a fresh pinned PyBytes and submit a single-shot owned recv into it.
-/// Frees any prior buffer first (only safe once the previous recv has completed
-/// or been cancelled). Returns error.NoBufferSpace if allocation fails.
+/// Pin a PyBytes and submit a single-shot owned recv into it. A buffer left
+/// pinned by pause_reading is reused, NOT freed: its cancelled recv may still
+/// write into it until the terminal CQE drains, and that stale write is harmless
+/// (the kernel orders it before the new recv's completion, whose byte count is
+/// what defines validity) while freeing would hand the kernel dead memory.
+/// Returns error.NoBufferSpace if allocation fails.
 fn armOwnedRecv(st: *State) !void {
-    py.clear(&st.recv_buf);
-    const data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
-    if (data == null) {
-        py.c.PyErr_Clear();
-        return error.NoBufferSpace;
+    if (st.recv_buf == null) {
+        const data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
+        if (data == null) {
+            py.c.PyErr_Clear();
+            return error.NoBufferSpace;
+        }
+        st.recv_buf = data;
     }
-    st.recv_buf = data;
-    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
+    const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(st.recv_buf));
     st.engine.submitRecvInto(st.fd, dst[0..READ_CHUNK]);
 }
 
 fn startReading(st: *State) !void {
+    st.recv_epoch +%= 1;
     if (usesCompletion(st)) {
         // The completion callback lives for the transport's whole lifetime (sends
         // route to it too, even while reading is paused); recv activation is
         // separate. registerCompletion is idempotent, so resume_reading is fine.
         try st.engine.registerCompletion(st.fd, .{ .func = ioCompleted, .ctx = st });
+        st.small_reads = 0;
+        // Static owned mode pins the strategy; adaptive always (re)starts on the
+        // ring - a resumed large-message stream re-escalates on its next full
+        // ring buffer.
         if (usesOwnedRecv(st)) {
+            st.recv_strategy = .owned;
             try armOwnedRecv(st);
         } else {
+            st.recv_strategy = .ring;
             try st.engine.startRecv(st.fd);
         }
     } else {
@@ -515,6 +559,7 @@ fn startReading(st: *State) !void {
 /// cancels the recv but keeps the callback registered so in-flight/queued sends
 /// still complete; full teardown happens via stopIo in doConnectionLost/dealloc.
 fn stopReading(st: *State) void {
+    st.recv_epoch +%= 1;
     if (usesCompletion(st)) {
         st.engine.stopRecv(st.fd);
     } else {
@@ -532,13 +577,18 @@ fn ioCompleted(ctx: *anyopaque, res: core.IoResult) void {
 }
 
 /// Recv branch. res.bytes==0 is a clean EOF; <0 is -errno; >0 delivers data.
-/// Ring mode: the kernel filled a ring buffer exposed as `res.buf`; copy it into
-/// a PyBytes (multishot - the loop re-arms). Owned mode: the kernel filled our
-/// pinned `recv_buf` directly; resize it to res.bytes, deliver, and re-arm with a
-/// fresh buffer (single-shot, so we always resubmit while reading so a trailing
-/// FIN is observed).
+/// Dispatches on the connection's recv strategy: ring/switching CQEs carry a
+/// kernel-filled ring slice in `res.buf` (copied into a PyBytes); owned CQEs
+/// report bytes the kernel wrote into our pinned `recv_buf`.
 fn readCompleted(st: *State, res: core.IoResult) void {
     if (st.conn_lost or !st.reading) return;
+    if (st.recv_strategy == .switching and res.bytes == core.RECV_ECANCELED) {
+        // The terminal CQE of our own escalation cancel, not a peer error: the
+        // multishot is disarmed, every prior ring CQE has been delivered, and
+        // nothing is in flight - the lossless point to hand the stream to owned.
+        enterOwnedMode(st);
+        return;
+    }
     if (res.bytes == 0) {
         handleEof(st);
         return;
@@ -547,10 +597,18 @@ fn readCompleted(st: *State, res: core.IoResult) void {
         fatalError(st, error.RecvFailed);
         return;
     }
-    if (usesOwnedRecv(st)) {
-        ownedRecvCompleted(st, @intCast(res.bytes));
-        return;
+    switch (st.recv_strategy) {
+        .owned => ownedRecvCompleted(st, @intCast(res.bytes)),
+        .ring, .switching => ringRecvCompleted(st, res),
     }
+}
+
+/// Deliver one ring CQE, then steer the recv strategy: a full ring buffer means
+/// the message fragmented (escalate to owned), and a dropped F_MORE means the
+/// multishot disarmed (re-arm it, or complete a pending escalation).
+fn ringRecvCompleted(st: *State, res: core.IoResult) void {
+    const full = res.buf.len == core.RECV_RING_BUF_SIZE;
+    const epoch = st.recv_epoch;
     const data = py.c.PyBytes_FromStringAndSize(res.buf.ptr, @intCast(res.buf.len));
     if (data == null) {
         py.c.PyErr_Clear();
@@ -563,12 +621,62 @@ fn readCompleted(st: *State, res: core.IoResult) void {
         }
         py.decref(r);
     }
+    // data_received may have paused, closed, or paused+resumed the transport; in
+    // all of those the recv arming is the reentrant call's problem, not ours -
+    // steering here too would put a second live recv on the fd.
+    if (st.conn_lost or !st.reading or st.recv_epoch != epoch) return;
+    switch (st.recv_strategy) {
+        .ring => {
+            if (full) {
+                if (res.more) {
+                    // Multishot still armed: cancel it WITHOUT bumping the recv
+                    // generation so already-posted ring CQEs (the rest of this
+                    // message) still deliver before the terminal hands off. If
+                    // the cancel SQE can't be queued no terminal will come -
+                    // stay on the ring and let the next full buffer retry.
+                    if (st.engine.escalateRecv(st.fd)) st.recv_strategy = .switching;
+                } else {
+                    // Multishot already disarmed by the kernel: nothing is in
+                    // flight, escalate right here.
+                    enterOwnedMode(st);
+                }
+            } else if (!res.more) {
+                // The ring momentarily ran dry and the kernel disarmed the
+                // multishot; re-arm it to keep reading.
+                st.engine.startRecv(st.fd) catch fatalError(st, error.RecvFailed);
+            }
+        },
+        .switching => if (!res.more) enterOwnedMode(st), // terminal arrived with data
+        .owned => {}, // unreachable: only enterOwnedMode (below) sets it
+    }
 }
 
-/// Owned-mode recv completion: the kernel wrote `n` bytes into the pinned
-/// `recv_buf`. Take it (it's no longer in flight), shrink to `n`, deliver, then
-/// re-arm a fresh buffer.
+fn enterOwnedMode(st: *State) void {
+    st.recv_strategy = .owned;
+    st.small_reads = 0;
+    armOwnedRecv(st) catch {
+        // Memory pressure: the 256 KiB buffer is an optimisation, not a need -
+        // keep the connection alive on the (fragmenting) ring instead of
+        // failing it. Nothing is in flight here, so re-arming is safe.
+        fallbackToRing(st);
+        return;
+    };
+    st.recv_switches +%= 1;
+}
+
+/// Re-arm the multishot ring after a failed owned-buffer escalation/re-arm; a
+/// later full ring buffer re-escalates once memory recovers.
+fn fallbackToRing(st: *State) void {
+    st.recv_strategy = .ring;
+    st.small_reads = 0;
+    st.engine.startRecv(st.fd) catch fatalError(st, error.RecvFailed);
+}
+
+/// Owned recv completion: the kernel wrote `n` bytes into the pinned `recv_buf`.
+/// Take it (it's no longer in flight), shrink to `n`, deliver, then re-arm -
+/// back on the ring once the stream reads small again, else another owned recv.
 fn ownedRecvCompleted(st: *State, n: usize) void {
+    const epoch = st.recv_epoch;
     var data = st.recv_buf;
     st.recv_buf = null; // the recv is done; this PyBytes is ours to deliver
     if (data == null) return; // shouldn't happen; nothing in flight
@@ -587,8 +695,24 @@ fn ownedRecvCompleted(st: *State, n: usize) void {
     py.decref(r);
     // Single-shot: re-arm for the next message if still reading. Resubmitting
     // after every positive recv is also how a trailing FIN gets observed (the
-    // next recv returns 0).
-    if (st.reading and !st.conn_lost) armOwnedRecv(st) catch fatalError(st, error.NoBufferSpace);
+    // next recv returns 0). An epoch change means a reentrant pause+resume
+    // already armed a recv - adding ours would interleave two on the fd.
+    if (st.conn_lost or !st.reading or st.recv_epoch != epoch) return;
+    if (!usesOwnedRecv(st)) { // adaptive (not pinned by ZLOOP_IO_URING=owned)
+        if (n < core.RECV_RING_BUF_SIZE) {
+            st.small_reads += 1;
+            if (st.small_reads >= OWNED_REVERT_AFTER) {
+                st.recv_strategy = .ring;
+                st.small_reads = 0;
+                st.recv_switches +%= 1;
+                st.engine.startRecv(st.fd) catch fatalError(st, error.RecvFailed);
+                return;
+            }
+        } else {
+            st.small_reads = 0;
+        }
+    }
+    armOwnedRecv(st) catch fallbackToRing(st);
 }
 
 fn handleEof(st: *State) void {
@@ -1068,6 +1192,13 @@ fn t_get_extra_info(self_obj: ?*c.PyObject, args: ?*c.PyObject) callconv(.c) py.
     const val = c.PyDict_GetItemWithError(st.extra, name); // borrowed
     if (val != null) return py.newRef(val);
     if (py.errOccurred()) return null;
+    // Live diagnostics, not stored in the extra dict. Completion backend only,
+    // and not after teardown (conn_lost guards a possibly-freed engine).
+    if (!st.conn_lost and c.PyUnicode_Check(name) != 0 and usesCompletion(st)) {
+        if (c.PyUnicode_CompareWithASCIIString(name, "zloop_recv_switches") == 0) {
+            return py.fromUsize(st.recv_switches);
+        }
+    }
     if (default != null) return py.newRef(default);
     return py.none();
 }

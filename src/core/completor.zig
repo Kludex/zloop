@@ -92,9 +92,13 @@ pub const Completion = struct {
 pub const WAKE_UD: u64 = std.math.maxInt(u64);
 /// Re-export so the loop can test multishot continuation without importing linux.
 pub const F_MORE: u32 = linux.IORING_CQE_F_MORE;
+/// -ECANCELED as a CQE result: the terminal completion of a cancelled op.
+pub const ECANCELED_RES: isize = -@as(isize, @intFromEnum(linux.E.CANCELED));
 
 const RECV_GROUP: u16 = 1;
-const RECV_BUF_SIZE: u32 = 64 * 1024;
+/// One provided-ring buffer. A recv CQE of exactly this length means the message
+/// overflowed the buffer and fragmented - the adaptive recv's escalation signal.
+pub const RECV_BUF_SIZE: u32 = 64 * 1024;
 const RECV_BUF_COUNT: u16 = 1024;
 const QUEUE_DEPTH: u16 = 256;
 
@@ -187,11 +191,19 @@ pub const Completor = struct {
     }
 
     /// Queue a cancel of every outstanding op tagged with `target_ud`. The
-    /// cancelled ops complete with -ECANCELED, reaped like any other.
-    pub fn cancel(self: *Completor, target_ud: u64, ud: u64) void {
-        const sqe = self.ensureSqe() catch return;
+    /// cancelled ops complete with -ECANCELED, reaped like any other. Errors
+    /// when no SQE could be acquired - callers whose state machine depends on
+    /// the terminal CQE actually coming (escalateRecv) must observe that.
+    pub fn tryCancel(self: *Completor, target_ud: u64, ud: u64) !void {
+        const sqe = try self.ensureSqe();
         sqe.prep_cancel(target_ud, 0);
         sqe.user_data = ud;
+    }
+
+    /// Best-effort cancel: for callers that bump the generation anyway
+    /// (stopRecv/stopIo, poll re-arms), a dropped cancel SQE is inconsequential.
+    pub fn cancel(self: *Completor, target_ud: u64, ud: u64) void {
+        self.tryCancel(target_ud, ud) catch {};
     }
 
     /// Recycle a recv buffer (by its completion) back to the kernel ring.

@@ -124,16 +124,38 @@ sequenceDiagram
 ```
 
 Because it's multishot, the transport **never re-issues a recv per message** - the
-kernel keeps delivering. The loop only re-arms in the rare case where the kernel
-drops the "more coming" flag (for example, the buffer pool momentarily ran dry)
-and the connection is still being read.
+kernel keeps delivering. The transport only re-arms in the rare case where the
+kernel drops the "more coming" flag (for example, the buffer pool momentarily ran
+dry) and the connection is still being read.
 
 When a recv completion arrives, the loop hands the transport the kernel-filled
 slice, the transport copies it into a `PyBytes` (with the GIL held) for
 `data_received`, and then the buffer is **recycled** back to the ring for reuse.
 That copy-out of the ring buffer is the one structural cost the readiness path
 doesn't pay (it reads straight into the `PyBytes`); it's negligible for the small
-messages this backend is tuned for.
+messages the ring is tuned for - and for large ones, a connection escalates off
+the ring entirely:
+
+### Large messages: adaptive owned-buffer recvs
+
+A message bigger than one ring buffer fragments into multiple completions, each
+paying a ring fill, a copy-out, and a `data_received` crossing - the reason 100
+KiB echoes used to run far behind the readiness path. So the recv strategy is
+**per connection and adaptive**: a completion that fills a whole 64 KiB ring
+buffer is the tell that the stream outgrew the ring, and the connection switches
+to **single-shot recvs straight into a pinned, uninitialised 256 KiB `PyBytes`** -
+one copy and one `data_received` per arrival, exactly like the readiness path.
+After a few consecutive reads small enough for one ring buffer, it switches back.
+
+The switch must not lose data the kernel already pulled into ring buffers, so it
+is a small protocol rather than a flag flip: the transport cancels the multishot
+**without bumping the recv generation** - already-posted ring completions keep
+delivering in order - and only when the multishot's terminal completion arrives
+(`-ECANCELED`, nothing in flight) does the first owned recv go out.
+
+Setting `ZLOOP_IO_URING=owned` pins every connection to owned-buffer recvs from
+the start (useful for benchmarking the two strategies in isolation);
+`ZLOOP_IO_URING=completion` is the adaptive default.
 
 ### Writes: SEND on the ring
 

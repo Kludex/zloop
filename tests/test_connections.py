@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 
 import pytest
@@ -75,6 +76,56 @@ def test_create_connection_large_payload_roundtrip(loop: asyncio.AbstractEventLo
         return result
 
     assert run(loop, main()) == payload
+
+
+def test_alternating_large_and_small_messages(loop: asyncio.AbstractEventLoop) -> None:
+    # Request/response with sizes that cross the completion backend's adaptive
+    # recv thresholds in both directions: a large message escalates a connection
+    # from the ring to owned-buffer recvs, a run of small ones reverts it, and a
+    # second large message escalates it again. Every byte must survive the
+    # strategy transitions (and on readiness backends this is just an echo test).
+    messages = [b"L" * (300 * 1024)] + [b"s" * 64] * 8 + [b"M" * (300 * 1024)] + [b"t" * 64] * 8
+
+    async def main() -> tuple[list[bytes], int | None]:
+        server, host, port = await _echo_server(loop)
+        received: list[bytes] = []
+        done: asyncio.Future[None] = loop.create_future()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                self.transport = transport
+                self.buf = bytearray()
+                self.idx = 0
+                transport.write(messages[0])  # type: ignore[attr-defined]
+
+            def data_received(self, data: bytes) -> None:
+                self.buf.extend(data)
+                if len(self.buf) < len(messages[self.idx]):
+                    return
+                received.append(bytes(self.buf[: len(messages[self.idx])]))
+                del self.buf[: len(messages[self.idx])]
+                self.idx += 1
+                if self.idx == len(messages):
+                    done.set_result(None)
+                else:
+                    self.transport.write(messages[self.idx])  # type: ignore[attr-defined]
+
+        transport, protocol = await loop.create_connection(Client, host, port)
+        await asyncio.wait_for(done, 10.0)
+        switches = transport.get_extra_info("zloop_recv_switches")
+        transport.close()
+        server.close()
+        await server.wait_closed()
+        return received, switches
+
+    received, switches = run(loop, main())
+    assert received == messages
+    # On the adaptive completion backend (Linux, ZLOOP_IO_URING=completion) the
+    # client transport must have escalated to owned recvs for each large echo and
+    # reverted on the small runs: ring->owned, owned->ring, ring->owned at least.
+    # Readiness backends (and ZLOOP_IO_URING=owned) report no switches.
+    if switches is not None and os.environ.get("ZLOOP_IO_URING") == "completion":
+        assert switches >= 3
 
 
 def test_create_connection_with_sock(loop: asyncio.AbstractEventLoop) -> None:
@@ -383,6 +434,60 @@ def test_pause_resume_reading(loop: asyncio.AbstractEventLoop) -> None:
         await loop.create_connection(Client, host, port)
         await asyncio.wait_for(ready, 2.0)
         assert b"".join(received) == b"payload"
+        server.close()
+        await server.wait_closed()
+
+    run(loop, main())
+
+
+def test_pause_resume_reading_inside_data_received(loop: asyncio.AbstractEventLoop) -> None:
+    # Reentrant pause+resume while a recv completion is being delivered: the
+    # resume arms a fresh recv, and the completion handler must not arm a second
+    # one on top - every message still arrives exactly once, in order.
+    messages = [b"one", b"two", b"three"]
+
+    async def main() -> None:
+        received: list[bytes] = []
+        done: asyncio.Future[None] = loop.create_future()
+
+        class Server(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                self.transport = transport
+                self.buf = bytearray()
+
+            def data_received(self, data: bytes) -> None:
+                self.transport.pause_reading()
+                self.transport.resume_reading()
+                self.buf.extend(data)
+                self.transport.write(data)
+                if len(self.buf) == sum(len(m) for m in messages):
+                    self.buf.clear()
+
+        server = await loop.create_server(Server, "127.0.0.1", 0)
+        host, port = server.sockets[0].getsockname()
+
+        class Client(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.Transport) -> None:
+                self.transport = transport
+                self.idx = 0
+                self.buf = bytearray()
+                transport.write(messages[0])
+
+            def data_received(self, data: bytes) -> None:
+                self.buf.extend(data)
+                if len(self.buf) < len(messages[self.idx]):
+                    return
+                received.append(bytes(self.buf[: len(messages[self.idx])]))
+                del self.buf[: len(messages[self.idx])]
+                self.idx += 1
+                if self.idx == len(messages):
+                    done.set_result(None)
+                else:
+                    self.transport.write(messages[self.idx])
+
+        await loop.create_connection(Client, host, port)
+        await asyncio.wait_for(done, 5.0)
+        assert received == messages
         server.close()
         await server.wait_closed()
 
