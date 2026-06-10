@@ -446,6 +446,52 @@ class Loop(_zloop.Loop):
             if not adopted:
                 conn.close()
 
+    async def connect_accepted_socket(
+        self,
+        protocol_factory: Any,
+        sock: socket.socket,
+        *,
+        ssl: Any = None,
+        ssl_handshake_timeout: float | None = None,
+        ssl_shutdown_timeout: float | None = None,
+    ) -> tuple[Any, Any]:
+        if sock.type != socket.SOCK_STREAM:
+            raise ValueError(f"A Stream Socket was expected, got {sock!r}")
+        if ssl_handshake_timeout is not None and not ssl:
+            raise ValueError("ssl_handshake_timeout is only meaningful with ssl")
+        if ssl_shutdown_timeout is not None and not ssl:
+            raise ValueError("ssl_shutdown_timeout is only meaningful with ssl")
+
+        sock.setblocking(False)
+        adopted = False
+        try:
+            protocol = protocol_factory()
+            extra = _make_extra(sock, ssl if ssl else None)
+            if ssl:
+                transport, waiter = start_tls_transport(
+                    self,
+                    sock,
+                    protocol,
+                    ssl,
+                    extra,
+                    server_side=True,
+                    ssl_handshake_timeout=ssl_handshake_timeout,
+                    ssl_shutdown_timeout=ssl_shutdown_timeout,
+                )
+                adopted = True
+                try:
+                    await waiter
+                except BaseException:
+                    transport.close()
+                    raise
+            else:
+                transport = self._make_transport(sock.fileno(), protocol, extra)
+                adopted = True
+        finally:
+            if not adopted:
+                sock.close()
+        return transport, protocol
+
     async def create_connection(
         self,
         protocol_factory: Any,
