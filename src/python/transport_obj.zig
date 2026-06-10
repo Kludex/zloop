@@ -380,8 +380,14 @@ fn deliverData(st: *State) void {
         if (st.conn_lost or !st.reading) return;
         var data = py.c.PyBytes_FromStringAndSize(null, READ_CHUNK); // uninitialised
         if (data == null) {
+            // Under memory pressure the chunk allocation can fail. Returning here
+            // would leave the bytes unread: a level-triggered reader re-fires on
+            // the still-readable fd and we spin retrying the same doomed alloc,
+            // making no progress (a livelock). Drain into a small stack buffer
+            // instead, which both makes progress and needs far less memory.
             py.c.PyErr_Clear();
-            return;
+            if (!deliverSmall(st)) return;
+            continue;
         }
         const dst: [*]u8 = @ptrCast(py.c.PyBytes_AsString(data));
         const n = sys.read(st.fd, dst[0..READ_CHUNK]) catch |err| switch (err) {
@@ -422,6 +428,44 @@ fn deliverData(st: *State) void {
         // here (the next recv returns 0). The extra EAGAIN recv is the cost of
         // being backend-agnostic.
     }
+}
+
+/// Memory-pressure fallback for deliverData: drain one read into a stack buffer
+/// and deliver it, allocating only the bytes actually read. Returns true if a
+/// chunk was delivered (so the caller should keep draining), false if it should
+/// stop (WouldBlock, EOF, or a fatal/protocol error - all handled here).
+fn deliverSmall(st: *State) bool {
+    var buf: [16 * 1024]u8 = undefined;
+    const n = sys.read(st.fd, &buf) catch |err| switch (err) {
+        error.WouldBlock, error.Interrupted => return false,
+        else => {
+            fatalError(st, err);
+            return false;
+        },
+    };
+    if (n == 0) {
+        handleEof(st);
+        return false;
+    }
+    const data = py.c.PyBytes_FromStringAndSize(&buf, @intCast(n));
+    if (data == null) {
+        // Even a small allocation failed: real OOM. Force the teardown directly
+        // rather than via fatalError - building its OSError can also fail here,
+        // and closeTransport would then defer while writes are queued, leaving
+        // the reader registered to re-enter this same loop. doConnectionLost
+        // stops the reader and closes the fd unconditionally.
+        py.c.PyErr_Clear();
+        doConnectionLost(st, null);
+        return false;
+    }
+    const r = callDataReceived(st, data);
+    py.decref(data);
+    if (r == null) {
+        reportProtocolError(st, "data_received");
+        return false;
+    }
+    py.decref(r);
+    return true;
 }
 
 /// Plain (non-buffered) connections use the completion backend when active;

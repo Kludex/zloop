@@ -23,6 +23,7 @@ graph TD
         B[Timer scheduling]
         C[Callback queue]
         D[kqueue / epoll reactor]
+        G[io_uring completion port - opt-in]
         E[Connected-socket transport I/O + flow control]
     end
     subgraph pyedge["Orchestration, in the Python edge 🐍"]
@@ -71,7 +72,8 @@ thread through that same executor. Standard asyncio strategy.
 ## So what's actually zloop?
 
 Everything that makes it an *event loop*: the run cycle, the timer heap, the
-callback queue, the kqueue/epoll reactor, the connected-socket transport I/O,
+callback queue, the kqueue/epoll reactor (plus the opt-in
+[io_uring completion port](completion.md)), the connected-socket transport I/O,
 the flow control, the GIL bracketing, the self-pipe wakeup.
 
 That's the part where performance lives, and that's the part written in Zig. The
@@ -81,7 +83,7 @@ loop factory.
 ```mermaid
 pie showData
     title Lines of code by language
-    "Zig (the engine)" : 3200
+    "Zig (the engine)" : 4700
     "Python (the edge + glue)" : 600
 ```
 

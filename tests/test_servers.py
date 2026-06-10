@@ -76,6 +76,94 @@ def test_create_server_with_preexisting_socket(loop: asyncio.AbstractEventLoop) 
     assert run(loop, main()) == b"x"
 
 
+def test_accept_caps_burst_then_reschedules_to_drain(loop: asyncio.AbstractEventLoop) -> None:
+    # _accept caps each readiness at backlog + 1 accepts so a connection flood
+    # can't starve the loop, then reschedules itself (not relying on a readiness
+    # re-fire, which the edge-triggered io_uring poll backend would not give) to
+    # take the rest. A fake listener with a fixed-size queue exercises both: the
+    # per-burst cap, and the cross-iteration draining of the remainder.
+    backlog = 3
+    queued = (backlog + 1) * 3 + 2  # several capped bursts plus a partial one
+
+    async def main() -> tuple[int, int]:
+        accepted = 0
+
+        class Counter(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                nonlocal accepted
+                accepted += 1
+
+        server = await loop.create_server(Counter, "127.0.0.1", 0, backlog=backlog)
+
+        pairs: list[tuple[socket.socket, socket.socket]] = []
+        remaining = queued
+
+        class FakeListener:
+            def accept(self) -> tuple[socket.socket, tuple[str, int]]:
+                nonlocal remaining
+                if remaining <= 0:
+                    raise BlockingIOError
+                remaining -= 1
+                a, b = socket.socketpair()
+                pairs.append((a, b))
+                return a, ("127.0.0.1", 0)
+
+        # The first call caps at backlog + 1 (the burst limit), then reschedules
+        # itself; pumping the loop drains the rest across iterations.
+        server._accept(FakeListener())  # type: ignore[arg-type]
+        first_burst = accepted
+        for _ in range(20):
+            if remaining <= 0:
+                break
+            await asyncio.sleep(0)
+
+        for a, b in pairs:
+            a.close()
+            b.close()
+        server.close()
+        await server.wait_closed()
+        return first_burst, accepted
+
+    first_burst, total = run(loop, main())
+    assert first_burst == backlog + 1  # one readiness accepts at most the cap
+    assert total == queued  # the rest are drained via reschedule, none dropped
+
+
+def test_accept_does_not_reschedule_after_close(loop: asyncio.AbstractEventLoop) -> None:
+    # A capped _accept that finds the server already closed must not reschedule
+    # itself (it would accept onto a torn-down server). Closing flips _active off.
+    async def main() -> int:
+        accepted = 0
+
+        class Counter(asyncio.Protocol):
+            def connection_made(self, transport: asyncio.BaseTransport) -> None:
+                nonlocal accepted
+                accepted += 1
+
+        server = await loop.create_server(Counter, "127.0.0.1", 0, backlog=2)
+
+        pairs: list[tuple[socket.socket, socket.socket]] = []
+
+        class AlwaysReady:
+            def accept(self) -> tuple[socket.socket, tuple[str, int]]:
+                a, b = socket.socketpair()
+                pairs.append((a, b))
+                return a, ("127.0.0.1", 0)
+
+        server.close()  # _active is now False
+        server._accept(AlwaysReady())  # type: ignore[arg-type]
+        await asyncio.sleep(0)  # any erroneous reschedule would run here
+
+        for a, b in pairs:
+            a.close()
+            b.close()
+        await server.wait_closed()
+        return accepted
+
+    # Exactly one capped burst, and no further accepts from a reschedule.
+    assert run(loop, main()) == 3
+
+
 def test_server_get_loop(loop: asyncio.AbstractEventLoop) -> None:
     async def main() -> None:
         server = await loop.create_server(asyncio.Protocol, "127.0.0.1", 0)

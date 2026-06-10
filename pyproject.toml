@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling", "hatch-ziglang", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
+requires = ["hatchling", "hatch-ziglang==0.2.0", "uv-dynamic-versioning>=0.8.0", "ziglang==0.16.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -33,6 +33,7 @@ docs = [
 ]
 bench = [
     "uvloop",  # the comparison baseline for bench_uvloop/bench_ci.py
+    "pytest-codspeed>=3.0",  # micro-benchmarks under tests/benchmarks/ (CodSpeed CI)
 ]
 
 [tool.hatch.version]
@@ -79,7 +80,9 @@ archs = ["arm64", "x86_64"]
 environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [tool.pytest.ini_options]
-addopts = "-rxXs --strict-config --strict-markers"
+# The CodSpeed micro-benchmarks live under tests/benchmarks/ and only run in the
+# dedicated CodSpeed CI job; ignore them in the normal suite and coverage gate.
+addopts = "-rxXs --strict-config --strict-markers --ignore=tests/benchmarks"
 asyncio_mode = "auto"
 xfail_strict = true
 testpaths = ["tests"]

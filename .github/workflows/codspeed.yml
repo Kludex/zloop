@@ -1,0 +1,43 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions: {}
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    # No token on forked PRs, so the upload would fail; CodSpeed runs on the base.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: read # clone the private repo
+    # Holds CODSPEED_TOKEN; keeps the secret scoped to this job (zizmor).
+    environment: codspeed
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: "0.16.0"
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies (incl. bench group, builds the extension)
+        run: scripts/install
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
+        with:
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          mode: instrumentation
+          run: .venv/bin/pytest tests/benchmarks/ --codspeed

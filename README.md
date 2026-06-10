@@ -1,5 +1,9 @@
 # zloop
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Kludex/zloop/main/docs/assets/logo.png" alt="zloop" height="190">
+</p>
+
 > [!WARNING]
 > zloop is experimental. The API and behaviour may change at any time, and it is not yet ready for production use.
 
@@ -14,7 +18,13 @@ libuv wrapped in Cython.
 import asyncio
 import zloop
 
-print(asyncio.run(asyncio.sleep(0, "hello from a Zig loop"), loop_factory=zloop.new_event_loop))
+
+async def main() -> None:
+    await asyncio.sleep(0)
+    print("hello from a Zig loop")
+
+
+asyncio.run(main(), loop_factory=zloop.new_event_loop)
 ```
 
 With [uvicorn](https://www.uvicorn.org):
