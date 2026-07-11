@@ -19,6 +19,8 @@ import signal as signal_module
 import socket
 import ssl as ssl_module
 import threading
+from asyncio import staggered
+from asyncio.base_events import _interleave_addrinfos  # type: ignore[attr-defined]
 from typing import Any
 
 from zloop import _zloop
@@ -466,23 +468,59 @@ class Loop(_zloop.Loop):
         all_errors: bool = False,
         **_: Any,
     ) -> tuple[Any, Any]:
+        if happy_eyeballs_delay is not None and interleave is None:
+            # When using happy eyeballs, default to interleaving addresses by family.
+            interleave = 1
+
         if sock is None:
             infos = await self.getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags)
-            exceptions: list[OSError] = []
-            for af, socktype, pr, _canon, address in infos:
-                sock = socket.socket(af, socktype, pr)
-                sock.setblocking(False)
-                try:
-                    if local_addr is not None:
-                        sock.bind(local_addr)
-                    await self._sock_connect(sock, address)
-                    break
-                except OSError as exc:
-                    sock.close()
-                    sock = None
-                    exceptions.append(exc)
+            if not infos:  # pragma: no cover - a successful resolve is non-empty
+                raise OSError("getaddrinfo() returned empty list")
+
+            if local_addr is not None:
+                laddr_infos = await self.getaddrinfo(
+                    *local_addr, family=family, type=socket.SOCK_STREAM, proto=proto, flags=flags
+                )
+                if not laddr_infos:
+                    raise OSError("getaddrinfo() returned empty list")
+            else:
+                laddr_infos = None
+
+            if interleave:
+                infos = _interleave_addrinfos(infos, interleave)
+
+            exceptions: list[list[OSError]] = []
+            if happy_eyeballs_delay is None:
+                for addrinfo in infos:
+                    try:
+                        sock = await self._connect_sock(exceptions, addrinfo, laddr_infos)
+                        break
+                    except OSError:
+                        continue
+            else:
+                sock = (
+                    await staggered.staggered_race(
+                        (
+                            functools.partial(self._connect_sock, exceptions, addrinfo, laddr_infos)
+                            for addrinfo in infos
+                        ),
+                        happy_eyeballs_delay,
+                        loop=self,
+                    )
+                )[0]
+
             if sock is None:
-                raise exceptions[-1] if exceptions else OSError("getaddrinfo returned empty list")
+                flat = [exc for sub in exceptions for exc in sub]
+                if all_errors:
+                    raise ExceptionGroup("create_connection failed", flat)
+                if len(flat) == 1:
+                    raise flat[0]
+                if flat:
+                    model = str(flat[0])
+                    if all(str(exc) == model for exc in flat):  # pragma: no cover - per-address errors differ
+                        raise flat[0]
+                    raise OSError(f"Multiple exceptions: {', '.join(str(exc) for exc in flat)}")
+                raise TimeoutError("create_connection failed")  # pragma: no cover - attempts always record an error
         else:
             sock.setblocking(False)
 
@@ -519,6 +557,45 @@ class Loop(_zloop.Loop):
             if not adopted:
                 sock.close()
         return transport, protocol
+
+    async def _connect_sock(
+        self,
+        exceptions: list[list[OSError]],
+        addr_info: Any,
+        local_addr_infos: list[Any] | None = None,
+    ) -> socket.socket:
+        """Create, bind and connect one socket; record failures per attempt."""
+        my_exceptions: list[OSError] = []
+        exceptions.append(my_exceptions)
+        family, type_, proto, _canon, address = addr_info
+        sock: socket.socket | None = None
+        try:
+            try:
+                sock = socket.socket(family=family, type=type_, proto=proto)
+                sock.setblocking(False)
+                if local_addr_infos is not None:
+                    for lfamily, _, _, _, laddr in local_addr_infos:
+                        if lfamily != family:  # skip local addresses of a different family
+                            continue
+                        try:
+                            sock.bind(laddr)
+                            break
+                        except OSError as exc:
+                            msg = f"error while attempting to bind on address {laddr!r}: {str(exc).lower()}"
+                            my_exceptions.append(OSError(exc.errno, msg))
+                    else:  # all bind attempts failed
+                        if my_exceptions:
+                            raise my_exceptions.pop()
+                        raise OSError(f"no matching local address with family={family!r} found")
+                await self._sock_connect(sock, address)
+                return sock
+            except OSError as exc:
+                my_exceptions.append(exc)
+                raise
+        except BaseException:  # close the half-open socket on any failure, then re-raise
+            if sock is not None:  # pragma: no branch - socket() rarely fails before assignment
+                sock.close()
+            raise
 
     async def _sock_connect(self, sock: socket.socket, address: Any) -> None:
         try:
