@@ -67,9 +67,8 @@ def _raise_in_thread() -> None:
     raise ValueError("in thread")
 
 
-def test_sock_connect_immediate(loop: asyncio.AbstractEventLoop) -> None:
-    # connecting a unix socketpair end is immediate (no EINPROGRESS), covering
-    # the fast path of _sock_connect.
+def test_create_connection_with_sock(loop: asyncio.AbstractEventLoop) -> None:
+    # passing a pre-connected sock skips create_connection's own connect path.
     class Echo(asyncio.Protocol):
         def connection_made(self, t: asyncio.BaseTransport) -> None:
             self.t = t
